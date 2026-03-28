@@ -263,6 +263,7 @@ func (r *ClawObservabilityReconciler) grafanaDatasourceConfigMap(obs *clawv1.Cla
 datasources:
   - name: Tempo
     type: tempo
+    uid: tempo
     access: proxy
     url: %s
     isDefault: true
