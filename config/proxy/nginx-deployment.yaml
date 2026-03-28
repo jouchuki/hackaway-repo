@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-proxy
+  namespace: clawbernetes
+  labels:
+    app: agent-proxy
+    app.kubernetes.io/managed-by: clawbernetes
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-proxy
+  template:
+    metadata:
+      labels:
+        app: agent-proxy
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: agent-proxy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-proxy
+  namespace: clawbernetes
+  labels:
+    app: agent-proxy
+    app.kubernetes.io/managed-by: clawbernetes
+spec:
+  selector:
+    app: agent-proxy
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+  type: NodePort

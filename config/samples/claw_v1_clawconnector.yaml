@@ -1,9 +1,19 @@
 apiVersion: claw.clawbernetes.io/v1
 kind: ClawConnector
 metadata:
+  name: production-postgres
+  namespace: clawbernetes
   labels:
-    app.kubernetes.io/name: hackaway-repo
-    app.kubernetes.io/managed-by: kustomize
-  name: clawconnector-sample
+    team: engineering
 spec:
-  # TODO(user): Add fields here
+  type: database
+  driver: postgresql
+  host: postgres.databases.svc.cluster.local
+  port: 5432
+  database: production
+  credentialsSecret: postgres-credentials
+  permissions:
+    - SELECT
+    - EXPLAIN
+  rateLimit:
+    requestsPerMinute: 30

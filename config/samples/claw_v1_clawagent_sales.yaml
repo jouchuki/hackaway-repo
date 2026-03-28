@@ -1,0 +1,41 @@
+apiVersion: claw.clawbernetes.io/v1
+kind: ClawAgent
+metadata:
+  name: sales-agent
+  namespace: clawbernetes
+  labels:
+    team: sales
+    tier: junior
+spec:
+  identity:
+    soul: |
+      You are a sales operations assistant. You help the sales team with
+      CRM data analysis, pipeline reporting, and outreach drafting. You
+      are upbeat, detail-oriented, and always back claims with data.
+    user: |
+      Your operator is a sales manager who values clear summaries and
+      actionable next steps. Keep responses concise and business-focused.
+    agentIdentity: |
+      I am sales-agent, the sales operations specialist for this org.
+  skillSet: engineering-skills
+  policy: engineering-policy
+  gateway: main-gateway
+  observability: fleet-observability
+  telemetryCapture:
+    inputMessages: true
+    outputMessages: true
+    sampleRate: "0.5"
+  model:
+    provider: anthropic
+    name: claude-haiku-4-5
+  resources:
+    requests:
+      memory: "1Gi"
+      cpu: "1"
+    limits:
+      memory: "4Gi"
+      cpu: "3"
+  lifecycle:
+    restartPolicy: Always
+    hibernateAfterIdleMinutes: 15
+    maxRuntime: "8h"

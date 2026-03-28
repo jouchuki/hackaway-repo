@@ -248,10 +248,9 @@ func (r *ClawObservabilityReconciler) tempoService(ns string) *corev1.Service {
 // ---------------------------------------------------------------------------
 
 func (r *ClawObservabilityReconciler) grafanaDatasourceConfigMap(obs *clawv1.ClawObservability, ns string) *corev1.ConfigMap {
-	endpoint := obs.Spec.OTLPEndpoint
-	if endpoint == "" {
-		endpoint = fmt.Sprintf("http://tempo.%s.svc.cluster.local:3200", ns)
-	}
+	// Grafana queries Tempo via its HTTP API on port 3200, NOT the OTLP
+	// write port (4318) that agents push traces to.
+	endpoint := fmt.Sprintf("http://tempo.%s.svc.cluster.local:3200", ns)
 
 	datasourceYAML := fmt.Sprintf(`apiVersion: 1
 datasources:

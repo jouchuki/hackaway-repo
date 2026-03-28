@@ -1,9 +1,19 @@
 apiVersion: claw.clawbernetes.io/v1
 kind: ClawPolicy
 metadata:
+  name: engineering-policy
+  namespace: clawbernetes
   labels:
-    app.kubernetes.io/name: hackaway-repo
-    app.kubernetes.io/managed-by: kustomize
-  name: clawpolicy-sample
+    team: engineering
 spec:
-  # TODO(user): Add fields here
+  toolPolicy:
+    deny:
+      - rm_rf
+      - drop_database
+      - kubectl_delete_namespace
+  budget:
+    daily: 10
+    monthly: 200
+    warnAt: "0.9"
+    downgradeModel: claude-haiku-4-5
+    downgradeProvider: anthropic

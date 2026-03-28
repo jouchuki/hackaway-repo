@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-proxy-config
+  namespace: clawbernetes
+  labels:
+    app: agent-proxy
+    app.kubernetes.io/managed-by: clawbernetes
+data:
+  nginx.conf: |
+    worker_processes 1;
+    events { worker_connections 128; }
+    http {
+      resolver kube-dns.kube-system.svc.cluster.local valid=5s;
+
+      map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+      }
+
+      server {
+        listen 80;
+        server_name eng-agent.local;
+        location / {
+          set $upstream_eng http://eng-agent.clawbernetes.svc.cluster.local:18789;
+          proxy_pass $upstream_eng;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection $connection_upgrade;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_read_timeout 300s;
+        }
+      }
+
+      server {
+        listen 80;
+        server_name sales-agent.local;
+        location / {
+          set $upstream_sales http://sales-agent.clawbernetes.svc.cluster.local:18789;
+          proxy_pass $upstream_sales;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection $connection_upgrade;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_read_timeout 300s;
+        }
+      }
+
+      server {
+        listen 80;
+        server_name grafana.local;
+        location / {
+          set $upstream_grafana http://grafana.clawbernetes.svc.cluster.local:3000;
+          proxy_pass $upstream_grafana;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection $connection_upgrade;
+          proxy_set_header Host $host;
+          proxy_read_timeout 300s;
+        }
+      }
+
+      server {
+        listen 80 default_server;
+        location / {
+          default_type text/plain;
+          return 200 "Clawbernetes Agent Proxy\n\nAvailable hosts:\n  eng-agent.local    - Engineering Agent\n  sales-agent.local  - Sales Agent\n  grafana.local      - Grafana Dashboard\n";
+        }
+      }
+    }
