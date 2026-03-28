@@ -1,135 +1,135 @@
-# hackaway-repo
-// TODO(user): Add simple overview of use/purpose
+# Clawbernetes
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+**Kubernetes-native orchestration for autonomous AI agent fleets.**
 
-## Getting Started
+Clawbernetes turns AI agent deployment into a `kubectl apply` workflow. Declare your agents, policies, and observability stack as Custom Resources -- the operator handles the rest.
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+## What It Does
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+One YAML, full fleet:
 
-```sh
-make docker-build docker-push IMG=<some-registry>/hackaway-repo:tag
+```yaml
+apiVersion: claw.clawbernetes.io/v1
+kind: ClawAgent
+metadata:
+  name: eng-agent
+spec:
+  identity:
+    soul: "You are a senior software engineer..."
+  model:
+    provider: anthropic
+    name: claude-sonnet-4-6
+  policy: engineering-policy
+  gateway: main-gateway
+  observability: fleet-observability
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+`kubectl apply` and the operator:
+1. Creates a Pod running [OpenClaw](https://github.com/orq-ai/openclaw) with identity files (SOUL.md, USER.md, IDENTITY.md)
+2. Installs the [observeclaw](https://github.com/ai-trust-layer/observeclaw) plugin for budget enforcement, tool policy, anomaly detection, and routing
+3. Routes all LLM traffic through a centralized ClawGateway proxy (PII redaction, optional complexity classification)
+4. Exports traces, metrics, and logs to Tempo via OpenTelemetry
+5. Visualizes everything in a pre-provisioned Grafana dashboard
 
-**Install the CRDs into the cluster:**
+## Architecture
 
-```sh
-make install
+```
+                       kubectl apply
+                            |
+                    +-------v--------+
+                    |   Operator     |
+                    | (Go, ctrl-rt)  |
+                    +---+---+---+----+
+                        |   |   |
+          +-------------+   |   +-------------+
+          |                 |                 |
+    ClawAgent          ClawGateway      ClawObservability
+    (per-agent pod)    (FastAPI proxy)  (Tempo + Grafana)
+          |                 |                 |
+    observeclaw plugin      |            OTLP traces
+    - budget enforcement    |                 |
+    - tool allow/deny       |           +-----v------+
+    - anomaly detection     |           |   Tempo    |
+    - routing evaluators    |           +-----+------+
+          |                 |                 |
+          +-----> LLM calls >----+      +-----v------+
+                                 |      |  Grafana   |
+                   api.anthropic.com    +------------+
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+## 6 CRDs
 
-```sh
-make deploy IMG=<some-registry>/hackaway-repo:tag
+| CRD | Purpose |
+|-----|---------|
+| **ClawAgent** | Declares an autonomous agent with identity, skills, model, and lifecycle settings |
+| **ClawGateway** | Centralized LLM proxy with routing evaluators and PII redaction |
+| **ClawPolicy** | Budget limits (daily/monthly), tool allow/deny lists, model downgrade thresholds |
+| **ClawSkillSet** | Reusable skill packages (SKILL.md files) mounted into agent workspaces |
+| **ClawConnector** | External service connections (databases, HTTP APIs) with rate limiting |
+| **ClawObservability** | Deploys Tempo + Grafana for distributed tracing and visualization |
+
+## Quick Start
+
+```bash
+# Prerequisites: Docker, kind, kubectl, Go 1.25+
+
+# 1. Create cluster, install CRDs, build images, deploy everything
+make demo-up
+
+# 2. Deploy nginx proxy for *.local hostnames
+make demo-proxy
+
+# 3. Add to /etc/hosts
+echo '127.0.0.1 eng-agent.local sales-agent.local grafana.local' | sudo tee -a /etc/hosts
+
+# 4. Port-forward
+kubectl port-forward svc/agent-proxy 8080:80 -n clawbernetes
+
+# 5. Access
+# http://localhost:8080                          - Fleet config dashboard
+# http://eng-agent.local:8080                   - Engineering agent UI
+# http://sales-agent.local:8080                 - Sales agent UI
+# http://grafana.local:8080/d/clawbernetes-fleet - Grafana fleet dashboard
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+Skip image rebuild on subsequent runs: `make demo-up SKIP_IMAGE=1`
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+## Key Features
 
-```sh
-kubectl apply -k config/samples/
+**Budget Enforcement** -- Set daily/monthly USD limits per agent. The observeclaw plugin tracks spend in real-time and automatically downgrades to a cheaper model (e.g. Haiku) when thresholds are hit.
+
+**Tool Policy** -- Deny dangerous tools (`rm_rf`, `drop_database`, `kubectl_delete_namespace`) at the plugin level. Allowlists supported.
+
+**Anomaly Detection** -- Five detectors running on configurable intervals: spend spikes, idle burn, error loops, token inflation, budget warnings. Alerts dispatch to configured webhooks.
+
+**Routing Evaluators** -- Chain regex blockers (prompt injection), classifiers (complexity routing), and proxy evaluators in priority order. All configured declaratively in the ClawGateway CRD.
+
+**Full Observability** -- Every LLM call is traced with OpenTelemetry (model, tokens, duration, session, channel). Traces flow to Tempo. Grafana dashboard shows fleet overview, per-agent activity, and performance stats.
+
+**Gateway Proxy** -- Centralized proxy between agents and LLM providers. Supports PII redaction via configurable regex patterns and optional HuggingFace classifier for complexity-based routing.
+
+## Tear Down
+
+```bash
+make demo-down          # Stop operator, delete CRs
+make kind-teardown      # Delete the kind cluster
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+## Project Structure
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
+```
+api/v1/                  # CRD type definitions
+internal/controller/     # Reconcilers for all 6 CRDs
+config/crd/              # Generated CRD manifests
+config/samples/          # Sample CRs for demo
+config/proxy/            # Nginx reverse proxy
+config/grafana/          # Dashboard JSON source
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+## Built With
 
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/hackaway-repo:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/hackaway-repo/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
-## License
-
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+- [Kubebuilder](https://kubebuilder.io/) -- operator scaffolding
+- [OpenClaw](https://github.com/orq-ai/openclaw) (orq-ai fork) -- agent runtime
+- [observeclaw](https://github.com/ai-trust-layer/observeclaw) -- budget/policy/anomaly plugin
+- [Grafana Tempo](https://grafana.com/oss/tempo/) -- distributed tracing
+- [Grafana](https://grafana.com/oss/grafana/) -- visualization
