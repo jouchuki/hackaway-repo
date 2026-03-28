@@ -64,6 +64,9 @@ func (r *ClawObservabilityReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 	// --- Tempo ---
 	if obs.Spec.Tempo.Enabled {
+		if err := r.ensureResource(ctx, obs, r.tempoConfigMap(ns), "tempo-config-cm"); err != nil {
+			return ctrl.Result{}, err
+		}
 		if err := r.ensureResource(ctx, obs, r.tempoDeployment(obs, ns), "tempo-deployment"); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -142,6 +145,36 @@ func (r *ClawObservabilityReconciler) isDeploymentAvailable(ctx context.Context,
 // Tempo helpers
 // ---------------------------------------------------------------------------
 
+func (r *ClawObservabilityReconciler) tempoConfigMap(ns string) *corev1.ConfigMap {
+	tempoYAML := `stream_over_http_enabled: true
+server:
+  http_listen_port: 3200
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: "0.0.0.0:4318"
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/traces
+    wal:
+      path: /var/tempo/wal
+`
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "tempo-config",
+			Namespace: ns,
+			Labels:    map[string]string{"app": "tempo", "app.kubernetes.io/managed-by": "clawbernetes"},
+		},
+		Data: map[string]string{
+			"tempo.yaml": tempoYAML,
+		},
+	}
+}
+
 func (r *ClawObservabilityReconciler) tempoDeployment(obs *clawv1.ClawObservability, ns string) *appsv1.Deployment {
 	labels := map[string]string{"app": "tempo", "app.kubernetes.io/managed-by": "clawbernetes"}
 	replicas := int32(1)
@@ -165,11 +198,24 @@ func (r *ClawObservabilityReconciler) tempoDeployment(obs *clawv1.ClawObservabil
 					Containers: []corev1.Container{
 						{
 							Name:  "tempo",
-							Image: "grafana/tempo:latest",
+							Image: "grafana/tempo:2.6.1",
 							Args:  args,
 							Ports: []corev1.ContainerPort{
 								{Name: "otlp-http", ContainerPort: 4318, Protocol: corev1.ProtocolTCP},
 								{Name: "tempo-http", ContainerPort: 3200, Protocol: corev1.ProtocolTCP},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "tempo-config", MountPath: "/etc/tempo", ReadOnly: true},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "tempo-config",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{Name: "tempo-config"},
+								},
 							},
 						},
 					},
