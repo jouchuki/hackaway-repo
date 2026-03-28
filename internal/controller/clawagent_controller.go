@@ -18,7 +18,9 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -27,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -47,8 +50,11 @@ type ClawAgentReconciler struct {
 // +kubebuilder:rbac:groups=claw.clawbernetes.io,resources=clawagents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=claw.clawbernetes.io,resources=clawobservabilities,verbs=get;list;watch
 // +kubebuilder:rbac:groups=claw.clawbernetes.io,resources=clawskillsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=claw.clawbernetes.io,resources=clawpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=claw.clawbernetes.io,resources=clawgateways,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 
 func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -95,8 +101,9 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
-	// --- Resolve ClawGateway URL if referenced ---
+	// --- Resolve ClawGateway if referenced ---
 	gatewayURL := ""
+	var gateway *clawv1.ClawGateway
 	if agent.Spec.Gateway != "" {
 		gw := &clawv1.ClawGateway{}
 		gwKey := types.NamespacedName{Name: agent.Spec.Gateway, Namespace: ns}
@@ -106,11 +113,27 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			}
 			log.Info("referenced ClawGateway not found, skipping gateway routing", "name", agent.Spec.Gateway)
 		} else {
+			gateway = gw
 			port := gw.Spec.Port
 			if port == 0 {
 				port = 8443
 			}
 			gatewayURL = fmt.Sprintf("http://%s-gateway.%s.svc.cluster.local:%d", agent.Spec.Gateway, ns, port)
+		}
+	}
+
+	// --- Resolve ClawPolicy if referenced ---
+	var policy *clawv1.ClawPolicy
+	if agent.Spec.Policy != "" {
+		pol := &clawv1.ClawPolicy{}
+		polKey := types.NamespacedName{Name: agent.Spec.Policy, Namespace: ns}
+		if err := r.Get(ctx, polKey, pol); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+			log.Info("referenced ClawPolicy not found", "name", agent.Spec.Policy)
+		} else {
+			policy = pol
 		}
 	}
 
@@ -126,9 +149,21 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
+	// --- OpenClaw config ConfigMap (openclaw.json + HEARTBEAT.md) ---
+	configCM := r.openclawConfigMap(agent, ns, name, gatewayURL, otlpEndpoint, policy, gateway)
+	if err := r.ensureResource(ctx, agent, configCM, "openclaw-config-configmap"); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// --- Agent Deployment ---
 	dep := r.agentDeployment(agent, ns, name, otlpEndpoint, gatewayURL, skills)
 	if err := r.ensureResource(ctx, agent, dep, "agent-deployment"); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// --- Agent Service ---
+	svc := r.agentService(ns, name)
+	if err := r.ensureResource(ctx, agent, svc, "agent-service"); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -217,36 +252,63 @@ func (r *ClawAgentReconciler) skillsConfigMap(ns, name string, skills []clawv1.S
 }
 
 // ---------------------------------------------------------------------------
+// OpenClaw config ConfigMap — openclaw.json + HEARTBEAT.md
+// ---------------------------------------------------------------------------
+
+func (r *ClawAgentReconciler) openclawConfigMap(agent *clawv1.ClawAgent, ns, name, gatewayURL, otlpEndpoint string, policy *clawv1.ClawPolicy, gateway *clawv1.ClawGateway) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name + "-openclaw-config",
+			Namespace: ns,
+			Labels:    agentLabels(name),
+		},
+		Data: map[string]string{
+			"openclaw.json": r.buildOpenclawConfig(agent, name, gatewayURL, otlpEndpoint, policy, gateway),
+			"HEARTBEAT.md":  r.heartbeatMD(name),
+		},
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Agent Deployment
 // ---------------------------------------------------------------------------
+
+const openclawGatewayPort = 18789
 
 func (r *ClawAgentReconciler) agentDeployment(agent *clawv1.ClawAgent, ns, name, otlpEndpoint, gatewayURL string, skills []clawv1.SkillEntry) *appsv1.Deployment {
 	labels := agentLabels(name)
 	replicas := int32(1)
 
-	// --- Init container: seed workspace files from the identity ConfigMap ---
-	// Build the openclaw.json config to route through the gateway.
-	configJSON := "{}"
-	if gatewayURL != "" {
-		configJSON = fmt.Sprintf(`{"models":{"providers":{"anthropic":{"baseUrl":"%s","models":[]}}}}`, gatewayURL)
+	// First init container: copy baked-in extensions (observeclaw) from
+	// the openclaw image into the shared emptyDir volume.
+	copyExtensions := corev1.Container{
+		Name:            "copy-extensions",
+		Image:           openclawImage,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Command: []string{"sh", "-c",
+			"cp -r /home/node/.openclaw/extensions /openclaw-home/extensions 2>/dev/null || true && echo 'extensions copied'",
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "openclaw-home", MountPath: "/openclaw-home"},
+		},
 	}
 
-	initContainer := corev1.Container{
+	// Second init container: seed workspace with config, identity, and skills.
+	seedWorkspace := corev1.Container{
 		Name:  "seed-workspace",
 		Image: "busybox:1.36",
 		Command: []string{"sh", "-c", strings.Join([]string{
 			"mkdir -p /openclaw-home/workspace/skills",
-			// Write openclaw.json config (gateway routing).
-			fmt.Sprintf("echo '%s' > /openclaw-home/openclaw.json", configJSON),
-			// Copy identity files if they exist in the ConfigMap mount.
+			"cp /config-src/openclaw.json /openclaw-home/openclaw.json",
+			"cp /config-src/HEARTBEAT.md /openclaw-home/workspace/HEARTBEAT.md",
 			"cp /identity-src/SOUL.md /openclaw-home/workspace/SOUL.md 2>/dev/null || true",
 			"cp /identity-src/USER.md /openclaw-home/workspace/USER.md 2>/dev/null || true",
 			"cp /identity-src/IDENTITY.md /openclaw-home/workspace/IDENTITY.md 2>/dev/null || true",
-			// Copy each skill into its own directory.
 			"for f in /skills-src/*; do [ -f \"$f\" ] && skill=$(basename \"$f\") && mkdir -p /openclaw-home/workspace/skills/$skill && cp \"$f\" /openclaw-home/workspace/skills/$skill/SKILL.md; done",
 			"echo 'workspace seeded'",
 		}, " && ")},
 		VolumeMounts: []corev1.VolumeMount{
+			{Name: "config-src", MountPath: "/config-src", ReadOnly: true},
 			{Name: "identity-src", MountPath: "/identity-src", ReadOnly: true},
 			{Name: "skills-src", MountPath: "/skills-src", ReadOnly: true},
 			{Name: "openclaw-home", MountPath: "/openclaw-home"},
@@ -278,6 +340,29 @@ func (r *ClawAgentReconciler) agentDeployment(agent *clawv1.ClawAgent, ns, name,
 				},
 			},
 		},
+		Ports: []corev1.ContainerPort{
+			{Name: "gateway", ContainerPort: int32(openclawGatewayPort), Protocol: corev1.ProtocolTCP},
+		},
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: "/ready",
+					Port: intstr.FromInt(openclawGatewayPort),
+				},
+			},
+			InitialDelaySeconds: 5,
+			PeriodSeconds:       10,
+		},
+		LivenessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: "/health",
+					Port: intstr.FromInt(openclawGatewayPort),
+				},
+			},
+			InitialDelaySeconds: 10,
+			PeriodSeconds:       30,
+		},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "openclaw-home", MountPath: "/home/node/.openclaw"},
 		},
@@ -297,6 +382,14 @@ func (r *ClawAgentReconciler) agentDeployment(agent *clawv1.ClawAgent, ns, name,
 			Name: "openclaw-home",
 			VolumeSource: corev1.VolumeSource{
 				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: "config-src",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: name + "-openclaw-config"},
+				},
 			},
 		},
 		{
@@ -342,7 +435,7 @@ func (r *ClawAgentReconciler) agentDeployment(agent *clawv1.ClawAgent, ns, name,
 						FSGroup:    int64Ptr(1000),
 					},
 					RestartPolicy:  restartPolicy,
-					InitContainers: []corev1.Container{initContainer},
+					InitContainers: []corev1.Container{copyExtensions, seedWorkspace},
 					Containers:     []corev1.Container{mainContainer},
 					Volumes:        volumes,
 				},
@@ -395,12 +488,375 @@ func int64Ptr(i int64) *int64 {
 	return &i
 }
 
+// ---------------------------------------------------------------------------
+// Agent Service
+// ---------------------------------------------------------------------------
+
+func (r *ClawAgentReconciler) agentService(ns, name string) *corev1.Service {
+	labels := agentLabels(name)
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+			Labels:    labels,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: labels,
+			Ports: []corev1.ServicePort{
+				{Name: "gateway", Port: int32(openclawGatewayPort), TargetPort: intstr.FromInt(openclawGatewayPort), Protocol: corev1.ProtocolTCP},
+			},
+		},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// OpenClaw config generation
+// ---------------------------------------------------------------------------
+
+// buildOpenclawConfig generates the full openclaw.json for the agent,
+// including the observeclaw plugin config derived from ClawPolicy + ClawGateway.
+func (r *ClawAgentReconciler) buildOpenclawConfig(agent *clawv1.ClawAgent, name, gatewayURL, otlpEndpoint string, policy *clawv1.ClawPolicy, gateway *clawv1.ClawGateway) string {
+	cfg := map[string]any{
+		"gateway": map[string]any{
+			"port": openclawGatewayPort,
+			"bind": "lan",
+			"http": map[string]any{
+				"endpoints": map[string]any{
+					"chatCompletions": map[string]any{"enabled": true},
+					"responses":       map[string]any{"enabled": true},
+				},
+			},
+			"controlUi": map[string]any{
+				"allowedOrigins": []string{
+					fmt.Sprintf("http://%s.local", name),
+					fmt.Sprintf("http://%s.local:8080", name),
+					fmt.Sprintf("http://localhost:%d", openclawGatewayPort),
+					fmt.Sprintf("http://127.0.0.1:%d", openclawGatewayPort),
+				},
+			},
+		},
+		"agents": map[string]any{
+			"defaults": map[string]any{
+				"heartbeat": map[string]any{
+					"every":           "5m",
+					"lightContext":    true,
+					"isolatedSession": true,
+					"ackMaxChars":     300,
+				},
+			},
+			"list": []map[string]any{
+				{"id": name, "default": true},
+			},
+		},
+	}
+
+	// --- diagnostics-otel: built-in extension in the orq-ai/openclaw fork ---
+	if otlpEndpoint != "" {
+		otelCfg := map[string]any{
+			"enabled":    true,
+			"endpoint":   otlpEndpoint,
+			"protocol":   "http/protobuf",
+			"serviceName": name,
+			"traces":     true,
+			"metrics":    true,
+			"logs":       true,
+			"sampleRate": 1.0,
+		}
+
+		// Wire TelemetryCaptureSpec — default everything on, let spec override.
+		tc := agent.Spec.TelemetryCapture
+		captureContent := map[string]any{
+			"inputMessages":      true,
+			"outputMessages":     true,
+			"systemInstructions": true,
+			"toolDefinitions":    true,
+			"toolContent":        true,
+		}
+		// If any field is explicitly set on the spec, use those values instead.
+		if tc.InputMessages || tc.OutputMessages || tc.SystemInstructions || tc.ToolDefinitions || tc.ToolContent {
+			captureContent["inputMessages"] = tc.InputMessages
+			captureContent["outputMessages"] = tc.OutputMessages
+			captureContent["systemInstructions"] = tc.SystemInstructions
+			captureContent["toolDefinitions"] = tc.ToolDefinitions
+			captureContent["toolContent"] = tc.ToolContent
+		}
+		otelCfg["captureContent"] = captureContent
+
+		if tc.SampleRate != "" {
+			if sr, err := strconv.ParseFloat(tc.SampleRate, 64); err == nil {
+				otelCfg["sampleRate"] = sr
+			}
+		}
+
+		cfg["diagnostics"] = map[string]any{
+			"enabled": true,
+			"otel":    otelCfg,
+		}
+	}
+
+	// --- Register a gateway-proxied Anthropic provider ---
+	if gatewayURL != "" {
+		cfg["models"] = map[string]any{
+			"providers": map[string]any{
+				"gateway-anthropic": map[string]any{
+					"baseUrl": gatewayURL,
+					"api":     "anthropic-messages",
+					"apiKey":  "${ANTHROPIC_API_KEY}",
+					"models": []map[string]any{
+						{
+							"id":            "claude-sonnet-4-6",
+							"name":          "Claude Sonnet 4.6 (via gateway)",
+							"reasoning":     true,
+							"input":         []string{"text"},
+							"contextWindow": 200000,
+							"maxTokens":     16384,
+						},
+						{
+							"id":            "claude-haiku-4-5",
+							"name":          "Claude Haiku 4.5 (via gateway)",
+							"reasoning":     false,
+							"input":         []string{"text"},
+							"contextWindow": 200000,
+							"maxTokens":     8192,
+						},
+					},
+				},
+			},
+		}
+	}
+
+	// --- Build observeclaw plugin config from ClawPolicy + ClawGateway ---
+	observeclawCfg := r.buildObserveclawConfig(name, gatewayURL, policy, gateway)
+
+	pluginEntries := map[string]any{
+		"observeclaw": map[string]any{
+			"enabled": true,
+			"config":  observeclawCfg,
+		},
+	}
+
+	// Enable the bundled diagnostics-otel extension.
+	if otlpEndpoint != "" {
+		pluginEntries["diagnostics-otel"] = map[string]any{
+			"enabled": true,
+		}
+	}
+
+	cfg["plugins"] = map[string]any{
+		"enabled": true,
+		"entries": pluginEntries,
+	}
+
+	b, _ := json.MarshalIndent(cfg, "", "  ")
+	return string(b)
+}
+
+// buildObserveclawConfig maps ClawPolicy + ClawGateway CRD fields to the
+// observeclaw plugin configSchema (see openclaw.plugin.json in
+// github.com/ai-trust-layer/observeclaw).
+func (r *ClawAgentReconciler) buildObserveclawConfig(agentName, gatewayURL string, policy *clawv1.ClawPolicy, gateway *clawv1.ClawGateway) map[string]any {
+	cfg := map[string]any{
+		"enabled":  true,
+		"currency": "USD",
+	}
+
+	// --- Budgets from ClawPolicy ---
+	budgetDefaults := map[string]any{
+		"daily":   100,
+		"monthly": 2000,
+		"warnAt":  0.8,
+	}
+	downgradeModel := "claude-haiku-4-5"
+	downgradeProvider := "anthropic"
+
+	if policy != nil {
+		b := policy.Spec.Budget
+		if b.Daily > 0 {
+			budgetDefaults["daily"] = b.Daily
+		}
+		if b.Monthly > 0 {
+			budgetDefaults["monthly"] = b.Monthly
+		}
+		if b.WarnAt != "" {
+			if warnAt, err := strconv.ParseFloat(b.WarnAt, 64); err == nil {
+				budgetDefaults["warnAt"] = warnAt
+			}
+		}
+		if b.DowngradeModel != "" {
+			downgradeModel = b.DowngradeModel
+		}
+		if b.DowngradeProvider != "" {
+			downgradeProvider = b.DowngradeProvider
+		}
+	}
+
+	cfg["budgets"] = map[string]any{
+		"defaults": budgetDefaults,
+		"agents":   map[string]any{},
+	}
+	cfg["downgradeModel"] = downgradeModel
+	cfg["downgradeProvider"] = downgradeProvider
+
+	// --- Tool policy from ClawPolicy ---
+	toolDefaults := map[string]any{
+		"allow": []string{},
+		"deny":  []string{},
+	}
+	if policy != nil {
+		tp := policy.Spec.ToolPolicy
+		if len(tp.Allow) > 0 {
+			toolDefaults["allow"] = tp.Allow
+		}
+		if len(tp.Deny) > 0 {
+			toolDefaults["deny"] = tp.Deny
+		}
+	}
+	cfg["toolPolicy"] = map[string]any{
+		"defaults": toolDefaults,
+		"agents":   map[string]any{},
+	}
+
+	// --- Anomaly detection from ClawGateway ---
+	anomalyCfg := map[string]any{
+		"spendSpikeMultiplier":     3,
+		"idleBurnMinutes":          10,
+		"errorLoopThreshold":       10,
+		"tokenInflationMultiplier": 2,
+		"checkIntervalSeconds":     30,
+	}
+	if gateway != nil {
+		a := gateway.Spec.Anomaly
+		if a.SpendSpikeMultiplier > 0 {
+			anomalyCfg["spendSpikeMultiplier"] = a.SpendSpikeMultiplier
+		}
+		if a.IdleBurnMinutes > 0 {
+			anomalyCfg["idleBurnMinutes"] = a.IdleBurnMinutes
+		}
+		if a.ErrorLoopThreshold > 0 {
+			anomalyCfg["errorLoopThreshold"] = a.ErrorLoopThreshold
+		}
+		if a.TokenInflationMultiplier > 0 {
+			anomalyCfg["tokenInflationMultiplier"] = a.TokenInflationMultiplier
+		}
+		if a.CheckIntervalSeconds > 0 {
+			anomalyCfg["checkIntervalSeconds"] = a.CheckIntervalSeconds
+		}
+	}
+	cfg["anomaly"] = anomalyCfg
+
+	// --- Routing: proxy all traffic through ClawGateway ---
+	evaluators := []map[string]any{}
+
+	if gateway != nil {
+		// Map CRD evaluators to observeclaw evaluator config.
+		for _, ev := range gateway.Spec.Routing.Evaluators {
+			entry := map[string]any{
+				"name":     ev.Name,
+				"type":     ev.Type,
+				"priority": ev.Priority,
+				"enabled":  true,
+			}
+			if ev.Action != "" {
+				entry["action"] = ev.Action
+			}
+			if len(ev.Patterns) > 0 {
+				entry["patterns"] = ev.Patterns
+			}
+			if ev.BlockReply != "" {
+				entry["blockReply"] = ev.BlockReply
+			}
+			if ev.EmitEvent {
+				entry["emitEvent"] = true
+			}
+			if ev.ClassifierModel != "" {
+				entry["classifierModel"] = ev.ClassifierModel
+			}
+			if ev.TimeoutMs > 0 {
+				entry["timeoutMs"] = ev.TimeoutMs
+			}
+			if ev.RedactReplacement != "" {
+				entry["redactReplacement"] = ev.RedactReplacement
+			}
+			if ev.ProxyURL != "" {
+				entry["proxyUrl"] = ev.ProxyURL
+			}
+			if ev.Routes != nil {
+				routes := map[string]any{}
+				for k, v := range ev.Routes {
+					routes[k] = map[string]any{
+						"provider": v.Provider,
+						"model":    v.Model,
+					}
+				}
+				entry["routes"] = routes
+			}
+			evaluators = append(evaluators, entry)
+		}
+	}
+
+	// Catch-all proxy: route all LLM traffic through the ClawGateway.
+	// Uses a regex that matches everything, with proxy action routing
+	// to the gateway-anthropic provider (baseUrl = gateway).
+	if gatewayURL != "" {
+		evaluators = append(evaluators, map[string]any{
+			"name":          "gateway-proxy",
+			"type":          "regex",
+			"priority":      0,
+			"enabled":       true,
+			"action":        "proxy",
+			"patterns":      []string{"[\\s\\S]"},
+			"proxyProvider": "gateway-anthropic",
+			"proxyModel":    "claude-sonnet-4-6",
+		})
+	}
+
+	cfg["routing"] = map[string]any{
+		"enabled":    len(evaluators) > 0,
+		"logRouting": gateway != nil && gateway.Spec.Routing.LogEveryDecision,
+		"evaluators": evaluators,
+	}
+
+	// --- Webhooks from ClawGateway ---
+	webhooks := []map[string]any{}
+	if gateway != nil {
+		for _, wh := range gateway.Spec.Webhooks {
+			entry := map[string]any{
+				"url": wh.URL,
+			}
+			if wh.MinSeverity != "" {
+				entry["minSeverity"] = wh.MinSeverity
+			}
+			if len(wh.Headers) > 0 {
+				entry["headers"] = wh.Headers
+			}
+			webhooks = append(webhooks, entry)
+		}
+	}
+	cfg["webhooks"] = webhooks
+
+	return cfg
+}
+
+// heartbeatMD generates a lightweight HEARTBEAT.md checklist for the agent.
+func (r *ClawAgentReconciler) heartbeatMD(name string) string {
+	return fmt.Sprintf(`# Heartbeat — %s
+
+Check the following and respond HEARTBEAT_OK if everything is normal.
+Only raise an alert if something needs attention.
+
+- Am I responsive?
+- Are my tools accessible?
+- Is my workspace intact?
+`, name)
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *ClawAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&clawv1.ClawAgent{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&corev1.Service{}).
 		Named("clawagent").
 		Complete(r)
 }

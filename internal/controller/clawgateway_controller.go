@@ -378,19 +378,26 @@ func (r *ClawGatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 // gatewayServerScript returns the observeclaw-server Python source.
-// For hackathon MVP, this is embedded directly. In production you'd build
-// a dedicated container image.
+// This is the PII redaction proxy + optional HF classifier that the
+// observeclaw plugin proxies all LLM traffic through.
 func gatewayServerScript() string {
 	return `"""
-ClawGateway Server — cost routing proxy + prompt injection blocking.
-Deployed by the Clawbernetes operator as a ConfigMap-mounted script.
+ObserveClaw Server — PII redaction proxy + optional local HF classifier.
+
+Endpoints:
+  POST /v1/messages          — PII-redacting proxy (strips PII, forwards to upstream)
+  POST /v1/chat/completions  — Local HuggingFace classifier (optional)
+  POST /config/patterns      — Push PII patterns from plugin config
+  GET  /health               — Health check
+
+The proxy forwards auth headers from the incoming request — no API key needed
+on the server. Configure the real key in the openclaw provider config.
 """
 import argparse
 import os
 import re
 import time
 import threading
-import json
 
 import httpx
 import uvicorn
@@ -398,66 +405,86 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="ClawGateway Server")
+app = FastAPI(title="ObserveClaw Server")
 
 UPSTREAM_BASE = os.environ.get("UPSTREAM_BASE_URL", "https://api.anthropic.com")
-OLLAMA_ENDPOINT = os.environ.get("OLLAMA_ENDPOINT", "")
-ROUTE_SIMPLE_MODEL = os.environ.get("ROUTE_SIMPLE_MODEL", "claude-haiku-4-5")
-ROUTE_COMPLEX_MODEL = os.environ.get("ROUTE_COMPLEX_MODEL", "claude-sonnet-4-6")
 
-# --- Prompt injection patterns (regex, zero-latency) ---
-INJECTION_PATTERNS = [
-    re.compile(r"\b(rm\s+-rf|sudo\s+|chmod\s+777)", re.IGNORECASE),
-    re.compile(r"\b(curl\s+.*\|\s*sh|wget\s+.*\|\s*bash)", re.IGNORECASE),
-    re.compile(r"ignore\s+(all\s+)?previous\s+instructions", re.IGNORECASE),
-    re.compile(r"you\s+are\s+now\s+(a|an)\s+", re.IGNORECASE),
-    re.compile(r"\[SYSTEM\]|\[INST\]", re.IGNORECASE),
-]
+_patterns_lock = threading.Lock()
+_pii_patterns: list[tuple[re.Pattern, str]] = []
 
 
-def check_injection(text: str) -> bool:
-    for pattern in INJECTION_PATTERNS:
-        if pattern.search(text):
-            return True
-    return False
+def _compile_patterns(raw: list[dict]) -> list[tuple[re.Pattern, str]]:
+    compiled = []
+    for entry in raw:
+        try:
+            compiled.append((re.compile(entry["pattern"]), entry.get("replacement", "[REDACTED]")))
+        except re.error as e:
+            print(f"[config] bad pattern {entry.get('pattern')!r}: {e}")
+    return compiled
 
 
-def extract_user_text(messages: list[dict]) -> str:
-    parts = []
+class PatternEntry(BaseModel):
+    pattern: str
+    replacement: str = "[REDACTED]"
+
+
+class PatternsConfig(BaseModel):
+    patterns: list[PatternEntry]
+
+
+@app.post("/config/patterns")
+async def update_patterns(config: PatternsConfig):
+    global _pii_patterns
+    raw = [p.model_dump() for p in config.patterns]
+    compiled = _compile_patterns(raw)
+    with _patterns_lock:
+        _pii_patterns = compiled
+    print(f"[config] loaded {len(compiled)} PII pattern(s)")
+    for p, r in compiled:
+        print(f"  {p.pattern} -> {r}")
+    return {"status": "ok", "patterns": len(compiled)}
+
+
+def redact(text: str) -> tuple[str, list[dict]]:
+    with _patterns_lock:
+        patterns = list(_pii_patterns)
+    redactions = []
+    for pattern, replacement in patterns:
+        for match in pattern.finditer(text):
+            redactions.append({
+                "original": match.group(),
+                "replacement": replacement,
+                "pattern": pattern.pattern,
+            })
+        text = pattern.sub(replacement, text)
+    return text, redactions
+
+
+def redact_messages(messages: list[dict]) -> tuple[list[dict], list[dict]]:
+    all_redactions = []
+    cleaned = []
     for msg in messages:
         if msg.get("role") == "user":
             content = msg.get("content", "")
             if isinstance(content, str):
-                parts.append(content)
+                redacted, redactions = redact(content)
+                all_redactions.extend(redactions)
+                cleaned.append({**msg, "content": redacted})
             elif isinstance(content, list):
+                new_blocks = []
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
-                        parts.append(block.get("text", ""))
-    return " ".join(parts)
-
-
-async def classify_complexity(text: str) -> str:
-    """Call Ollama or local classifier to determine query complexity."""
-    if not OLLAMA_ENDPOINT:
-        return "complex"
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.post(
-                f"{OLLAMA_ENDPOINT}/v1/chat/completions",
-                json={
-                    "model": "query-complexity",
-                    "messages": [{"role": "user", "content": text[:500]}],
-                    "max_tokens": 10,
-                },
-            )
-            if resp.status_code == 200:
-                label = resp.json()["choices"][0]["message"]["content"].strip().lower()
-                if "simple" in label:
-                    return "simple"
-            return "complex"
-    except Exception as e:
-        print(f"[classify] error: {e}, defaulting to complex")
-        return "complex"
+                        redacted, redactions = redact(block.get("text", ""))
+                        all_redactions.extend(redactions)
+                        new_blocks.append({**block, "text": redacted})
+                    else:
+                        new_blocks.append(block)
+                cleaned.append({**msg, "content": new_blocks})
+            else:
+                cleaned.append(msg)
+        else:
+            cleaned.append(msg)
+    return cleaned, all_redactions
 
 
 _FORWARD_HEADERS = ("x-api-key", "anthropic-version", "authorization", "anthropic-beta")
@@ -466,25 +493,16 @@ _FORWARD_HEADERS = ("x-api-key", "anthropic-version", "authorization", "anthropi
 @app.api_route("/v1/messages", methods=["POST"])
 async def proxy_messages(request: Request):
     body = await request.json()
-    messages = body.get("messages", [])
-    user_text = extract_user_text(messages)
 
-    # --- Stage 1: Prompt injection check (regex, ~0ms) ---
-    if check_injection(user_text):
-        print(f"[BLOCKED] prompt injection detected: {user_text[:80]}...")
-        return JSONResponse(
-            status_code=400,
-            content={"error": {"type": "blocked", "message": "Blocked: prompt injection detected."}},
-        )
+    original_messages = body.get("messages", [])
+    cleaned_messages, redactions = redact_messages(original_messages)
+    body["messages"] = cleaned_messages
 
-    # --- Stage 2: Complexity routing ---
-    complexity = await classify_complexity(user_text)
-    routed_model = ROUTE_SIMPLE_MODEL if complexity == "simple" else ROUTE_COMPLEX_MODEL
-    original_model = body.get("model", "unknown")
-    body["model"] = routed_model
-    print(f"[route] {complexity} | {original_model} -> {routed_model} | {user_text[:60]}...")
+    if redactions:
+        print(f"[redact] {len(redactions)} PII match(es):")
+        for r in redactions:
+            print(f"  {r['original']} -> {r['replacement']}")
 
-    # Forward to upstream
     headers = {"Content-Type": "application/json"}
     for key in _FORWARD_HEADERS:
         val = request.headers.get(key)
@@ -494,12 +512,18 @@ async def proxy_messages(request: Request):
     is_stream = body.get("stream", False)
 
     if is_stream:
+        stream_headers = {**headers, "Accept-Encoding": "identity"}
         client = httpx.AsyncClient(timeout=120.0)
-        req = client.build_request("POST", f"{UPSTREAM_BASE}/v1/messages", json=body, headers=headers)
+        req = client.build_request(
+            "POST",
+            f"{UPSTREAM_BASE}/v1/messages",
+            json=body,
+            headers=stream_headers,
+        )
         resp = await client.send(req, stream=True)
 
         response_headers = {}
-        for key in ("content-type", "x-request-id"):
+        for key in ("content-type", "x-request-id", "content-encoding"):
             val = resp.headers.get(key)
             if val:
                 response_headers[key] = val
@@ -512,36 +536,161 @@ async def proxy_messages(request: Request):
                 await resp.aclose()
                 await client.aclose()
 
-        return StreamingResponse(passthrough(), status_code=resp.status_code, headers=response_headers)
+        return StreamingResponse(
+            passthrough(),
+            status_code=resp.status_code,
+            headers=response_headers,
+        )
     else:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(f"{UPSTREAM_BASE}/v1/messages", json=body, headers=headers)
-            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+            resp = await client.post(
+                f"{UPSTREAM_BASE}/v1/messages",
+                json=body,
+                headers=headers,
+            )
+            return resp.json()
+
+
+_classifier = None
+
+
+def _load_classifier(model_id: str, labels: list[str]) -> dict:
+    import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    print(f"Loading classifier: {model_id}...")
+    t = time.time()
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForSequenceClassification.from_pretrained(model_id)
+    print(f"Classifier loaded in {time.time() - t:.1f}s ({model_id}, labels: {labels})")
+    return {"tokenizer": tokenizer, "model": model, "labels": labels, "model_id": model_id}
+
+
+class ClassifierMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ClassifierRequest(BaseModel):
+    model: str = ""
+    messages: list[ClassifierMessage]
+    max_tokens: int = 50
+    temperature: float = 0
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: ClassifierRequest):
+    import torch
+
+    if _classifier is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Classifier not loaded. Start server without --no-classifier."},
+        )
+
+    tokenizer = _classifier["tokenizer"]
+    model = _classifier["model"]
+    labels = _classifier["labels"]
+
+    text = req.messages[-1].content if req.messages else ""
+
+    start = time.time()
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    probs = torch.softmax(outputs.logits, dim=1)[0].tolist()
+    prediction = torch.argmax(outputs.logits, dim=1).item()
+    label = labels[prediction] if prediction < len(labels) else f"class_{prediction}"
+    elapsed_ms = (time.time() - start) * 1000
+
+    prob_str = " ".join(f"{labels[i] if i < len(labels) else f'c{i}'}:{p:.2f}" for i, p in enumerate(probs))
+    preview = text[:80] + "..." if len(text) > 80 else text
+    print(f"[classify] [{label}] {prob_str} ({elapsed_ms:.0f}ms) | {preview}")
+
+    return {
+        "id": "cmpl-classifier",
+        "object": "chat.completion",
+        "model": req.model or _classifier["model_id"],
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": label},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": len(inputs["input_ids"][0]),
+            "completion_tokens": 1,
+            "total_tokens": len(inputs["input_ids"][0]) + 1,
+        },
+    }
 
 
 @app.get("/health")
 async def health():
-    return {
+    with _patterns_lock:
+        pattern_count = len(_pii_patterns)
+    result: dict = {
         "status": "ok",
-        "routing": {
-            "simple": ROUTE_SIMPLE_MODEL,
-            "complex": ROUTE_COMPLEX_MODEL,
+        "services": {
+            "redaction_proxy": {
+                "pii_patterns": pattern_count,
+                "upstream": UPSTREAM_BASE,
+            },
         },
-        "upstream": UPSTREAM_BASE,
-        "ollama": OLLAMA_ENDPOINT or "disabled",
     }
+    if _classifier is not None:
+        result["services"]["classifier"] = {
+            "model": _classifier["model_id"],
+            "labels": _classifier["labels"],
+        }
+    else:
+        result["services"]["classifier"] = {"status": "disabled"}
+    return result
 
+
+DEFAULT_CLASSIFIER_MODEL = "Shaheer001/Query-Complexity-Classifier"
+DEFAULT_CLASSIFIER_LABELS = "simple,medium,complex"
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ClawGateway Server")
+    parser = argparse.ArgumentParser(description="ObserveClaw Server")
     parser.add_argument("--port", type=int, default=int(os.environ.get("GATEWAY_PORT", "8443")))
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--no-classifier", action="store_true")
+    parser.add_argument(
+        "--upstream",
+        default=os.environ.get("UPSTREAM_BASE_URL", "https://api.anthropic.com"),
+        help="Upstream LLM base URL",
+    )
+    parser.add_argument(
+        "--classifier-model",
+        default=os.environ.get("CLASSIFIER_MODEL", DEFAULT_CLASSIFIER_MODEL),
+        help=f"HuggingFace model ID (default: {DEFAULT_CLASSIFIER_MODEL})",
+    )
+    parser.add_argument(
+        "--classifier-labels",
+        default=os.environ.get("CLASSIFIER_LABELS", DEFAULT_CLASSIFIER_LABELS),
+        help=f"Comma-separated labels (default: {DEFAULT_CLASSIFIER_LABELS})",
+    )
+    parser.add_argument(
+        "--no-classifier",
+        action="store_true",
+        help="Skip classifier model loading (PII proxy only, fast startup)",
+    )
     args = parser.parse_args()
 
-    print(f"ClawGateway listening on http://{args.host}:{args.port}")
-    print(f"  /v1/messages -> cost routing proxy -> {UPSTREAM_BASE}")
-    print(f"  simple -> {ROUTE_SIMPLE_MODEL} | complex -> {ROUTE_COMPLEX_MODEL}")
+    UPSTREAM_BASE = args.upstream
+
+    if not args.no_classifier:
+        labels = [l.strip() for l in args.classifier_labels.split(",")]
+        _classifier = _load_classifier(args.classifier_model, labels)
+
+    print(f"ObserveClaw Server listening on http://{args.host}:{args.port}")
+    print(f"  /v1/messages         -> PII redaction proxy ({0} patterns) -> {UPSTREAM_BASE}")
+    print(f"  /config/patterns     -> push PII patterns from plugin")
+    if _classifier:
+        print(f"  /v1/chat/completions -> classifier ({_classifier['model_id']})")
+    else:
+        print(f"  /v1/chat/completions -> disabled")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 `
 }

@@ -152,11 +152,13 @@ OPENCLAW_IMG ?= clawbernetes/openclaw:latest
 KIND_CLUSTER_NAME ?= clawbernetes
 
 .PHONY: build-openclaw-image
-build-openclaw-image: ## Clone the orq.ai OpenClaw fork and build the container image.
+build-openclaw-image: ## Clone the orq.ai OpenClaw fork, install observeclaw plugin, and build the container image.
 	$(eval TMPDIR := $(shell mktemp -d))
 	git clone https://github.com/orq-ai/openclaw.git $(TMPDIR)/openclaw
 	-cd $(TMPDIR)/openclaw && git submodule update --init --recursive 2>/dev/null || true
-	$(CONTAINER_TOOL) build -t $(OPENCLAW_IMG) $(TMPDIR)/openclaw
+	$(CONTAINER_TOOL) build -t $(OPENCLAW_IMG)-base $(TMPDIR)/openclaw
+	@printf 'FROM %s\nRUN timeout 60 openclaw plugins install observeclaw || true\n' "$(OPENCLAW_IMG)-base" > $(TMPDIR)/Dockerfile.observeclaw
+	$(CONTAINER_TOOL) build -t $(OPENCLAW_IMG) -f $(TMPDIR)/Dockerfile.observeclaw $(TMPDIR)
 	rm -rf $(TMPDIR)
 
 .PHONY: load-kind
@@ -192,8 +194,13 @@ demo: kind-setup ## Full local demo: create kind cluster, install CRDs, print ne
 	@echo "Next: make demo-up"
 	@echo ""
 
+SKIP_IMAGE ?= 0
+
 .PHONY: demo-up
-demo-up: build build-openclaw-image kind-setup load-kind create-secrets ## One command: build everything, load images, apply all CRs, run operator.
+demo-up: build kind-setup create-secrets ## One command: build everything, load images, apply all CRs, run operator.
+ifeq ($(SKIP_IMAGE),0)
+	$(MAKE) build-openclaw-image load-kind
+endif
 	@# Clean up any previous operator
 	@fuser -k 8081/tcp 2>/dev/null || true
 	@fuser -k 8080/tcp 2>/dev/null || true
@@ -213,7 +220,10 @@ demo-up: build build-openclaw-image kind-setup load-kind create-secrets ## One c
 	@# Apply all sample CRs in dependency order
 	$(KUBECTL) apply -f config/samples/claw_v1_clawobservability.yaml
 	$(KUBECTL) apply -f config/samples/claw_v1_clawskillset.yaml
+	$(KUBECTL) apply -f config/samples/claw_v1_clawpolicy.yaml
+	$(KUBECTL) apply -f config/samples/claw_v1_clawconnector.yaml
 	$(KUBECTL) apply -f config/samples/claw_v1_clawagent.yaml
+	$(KUBECTL) apply -f config/samples/claw_v1_clawagent_sales.yaml
 	@echo ""
 	@echo "=== All resources applied. Waiting for pods... ==="
 	@sleep 10
@@ -222,10 +232,39 @@ demo-up: build build-openclaw-image kind-setup load-kind create-secrets ## One c
 	@$(KUBECTL) get clawobservabilities -n clawbernetes
 	@$(KUBECTL) get clawagents -n clawbernetes
 	@echo ""
-	@echo "Open Grafana:  kubectl port-forward svc/grafana 3000:3000 -n clawbernetes"
+	@echo ""
+	@echo "Next: make demo-proxy"
 	@echo "Watch pods:    kubectl get pods -n clawbernetes -w"
 	@echo "Operator log:  tail -f /tmp/clawbernetes-operator.log"
 	@echo "Tear down:     make demo-down"
+
+.PHONY: demo-proxy
+demo-proxy: ## Deploy agent proxy and set up *.local hostnames.
+	@$(KUBECTL) apply -f config/proxy/nginx-configmap.yaml
+	@$(KUBECTL) apply -f config/proxy/nginx-deployment.yaml
+	@echo "Waiting for proxy pod..."
+	@$(KUBECTL) wait --for=condition=available deploy/agent-proxy -n clawbernetes --timeout=30s
+	@$(eval PROXY_PORT := $(shell $(KUBECTL) get svc agent-proxy -n clawbernetes -o jsonpath='{.spec.ports[0].nodePort}'))
+	@echo ""
+	@echo "=== Agent Proxy ready ==="
+	@echo ""
+	@echo "Add to /etc/hosts (needs sudo):"
+	@echo "  echo '127.0.0.1 eng-agent.local sales-agent.local grafana.local' | sudo tee -a /etc/hosts"
+	@echo ""
+	@echo "Then run:"
+	@echo "  kubectl port-forward svc/agent-proxy 8080:80 -n clawbernetes"
+	@echo ""
+	@echo "Access:"
+	@echo "  http://eng-agent.local:8080     — Engineering Agent (OpenClaw UI)"
+	@echo "  http://sales-agent.local:8080   — Sales Agent (OpenClaw UI)"
+	@echo "  http://grafana.local:8080       — Grafana (Traces)"
+	@echo "  http://localhost:8080           — Landing page"
+	@echo ""
+	@echo "API (get token from agent logs):"
+	@echo "  curl http://eng-agent.local:8080/v1/chat/completions \\"
+	@echo "    -H 'Authorization: Bearer TOKEN' \\"
+	@echo "    -H 'Content-Type: application/json' \\"
+	@echo "    -d '{\"model\":\"openclaw/default\",\"messages\":[{\"role\":\"user\",\"content\":\"who are you?\"}]}'"
 
 .PHONY: demo-down
 demo-down: ## Stop operator, delete all CRs, optionally tear down cluster.
@@ -234,6 +273,8 @@ demo-down: ## Stop operator, delete all CRs, optionally tear down cluster.
 	@$(KUBECTL) delete clawagents --all -n clawbernetes --ignore-not-found 2>/dev/null || true
 	@$(KUBECTL) delete clawobservabilities --all -n clawbernetes --ignore-not-found 2>/dev/null || true
 	@$(KUBECTL) delete clawskillsets --all -n clawbernetes --ignore-not-found 2>/dev/null || true
+	@$(KUBECTL) delete -f config/proxy/nginx-deployment.yaml --ignore-not-found 2>/dev/null || true
+	@$(KUBECTL) delete -f config/proxy/nginx-configmap.yaml --ignore-not-found 2>/dev/null || true
 	@echo "=== Demo stopped. Run 'make kind-teardown' to delete the cluster ==="
 
 ##@ Deployment

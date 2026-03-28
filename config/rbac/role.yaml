@@ -65,6 +65,7 @@ rules:
 - apiGroups:
   - claw.clawbernetes.io
   resources:
+  - clawpolicies
   - clawskillsets
   verbs:
   - get
