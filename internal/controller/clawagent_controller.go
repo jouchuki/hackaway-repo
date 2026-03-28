@@ -95,6 +95,25 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
+	// --- Resolve ClawGateway URL if referenced ---
+	gatewayURL := ""
+	if agent.Spec.Gateway != "" {
+		gw := &clawv1.ClawGateway{}
+		gwKey := types.NamespacedName{Name: agent.Spec.Gateway, Namespace: ns}
+		if err := r.Get(ctx, gwKey, gw); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+			log.Info("referenced ClawGateway not found, skipping gateway routing", "name", agent.Spec.Gateway)
+		} else {
+			port := gw.Spec.Port
+			if port == 0 {
+				port = 8443
+			}
+			gatewayURL = fmt.Sprintf("http://%s-gateway.%s.svc.cluster.local:%d", agent.Spec.Gateway, ns, port)
+		}
+	}
+
 	// --- Identity ConfigMap (SOUL.md, USER.md, IDENTITY.md) ---
 	identityCM := r.identityConfigMap(agent, ns, name)
 	if err := r.ensureResource(ctx, agent, identityCM, "identity-configmap"); err != nil {
@@ -108,7 +127,7 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// --- Agent Deployment ---
-	dep := r.agentDeployment(agent, ns, name, otlpEndpoint, skills)
+	dep := r.agentDeployment(agent, ns, name, otlpEndpoint, gatewayURL, skills)
 	if err := r.ensureResource(ctx, agent, dep, "agent-deployment"); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -201,16 +220,24 @@ func (r *ClawAgentReconciler) skillsConfigMap(ns, name string, skills []clawv1.S
 // Agent Deployment
 // ---------------------------------------------------------------------------
 
-func (r *ClawAgentReconciler) agentDeployment(agent *clawv1.ClawAgent, ns, name, otlpEndpoint string, skills []clawv1.SkillEntry) *appsv1.Deployment {
+func (r *ClawAgentReconciler) agentDeployment(agent *clawv1.ClawAgent, ns, name, otlpEndpoint, gatewayURL string, skills []clawv1.SkillEntry) *appsv1.Deployment {
 	labels := agentLabels(name)
 	replicas := int32(1)
 
 	// --- Init container: seed workspace files from the identity ConfigMap ---
+	// Build the openclaw.json config to route through the gateway.
+	configJSON := "{}"
+	if gatewayURL != "" {
+		configJSON = fmt.Sprintf(`{"models":{"providers":{"anthropic":{"baseUrl":"%s","models":[]}}}}`, gatewayURL)
+	}
+
 	initContainer := corev1.Container{
 		Name:  "seed-workspace",
 		Image: "busybox:1.36",
 		Command: []string{"sh", "-c", strings.Join([]string{
 			"mkdir -p /openclaw-home/workspace/skills",
+			// Write openclaw.json config (gateway routing).
+			fmt.Sprintf("echo '%s' > /openclaw-home/openclaw.json", configJSON),
 			// Copy identity files if they exist in the ConfigMap mount.
 			"cp /identity-src/SOUL.md /openclaw-home/workspace/SOUL.md 2>/dev/null || true",
 			"cp /identity-src/USER.md /openclaw-home/workspace/USER.md 2>/dev/null || true",
