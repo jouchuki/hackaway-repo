@@ -1,0 +1,835 @@
+# =============================================================================
+# CLAWBERNETES — Agent Infrastructure Manifest
+# =============================================================================
+# The core thesis: OpenClaw is the new standard for autonomous agents.
+# Companies will run fleets of them. Right now, deploying and governing those
+# fleets is a mess of ansible playbooks, manually placed markdown files, and
+# zero visibility into what any agent is doing or spending.
+#
+# Clawbernetes introduces Kubernetes-native primitives that make agents,
+# their identity, their skills, their policies, their connectors, and their
+# telemetry all first-class declarable resources — just like Deployments and
+# Services are first-class for stateless web apps.
+#
+# You declare the full shape of an agent in YAML. The operator brings it to life.
+# No ansible. No SSH. No manually seeding SOUL.md on a bare metal DGX.
+#
+# Prerequisites before applying any of this:
+#
+# 1. Install the orq.ai fork of OpenClaw (adds OTEL tracing + 45+ model access):
+#      git clone --recurse-submodules https://github.com/orq-ai/openclaw.git
+#      cd openclaw && pnpm install && pnpm ui:build && pnpm build
+#
+# 2. Enable the OTEL tracing plugin from the orq.ai fork.
+#    This plugin is independent of the orq.ai model provider — you do NOT need
+#    an orq.ai API key. It ships traces to any OTLP-compatible collector.
+#    The operator deploys Grafana Tempo inside the cluster as the collector,
+#    so telemetry never leaves your infrastructure.
+#      openclaw plugins enable diagnostics-otel
+#    The operator injects the correct endpoint automatically from ClawGateway spec.
+#
+# 3. Install the observeclaw plugin (budget enforcement, PII redaction, routing):
+#      openclaw plugins install observeclaw
+#      openclaw plugins enable observeclaw
+#      openclaw gateway restart
+#
+# 4. Have a running Kubernetes cluster (kind, k3s, GKE, bare metal — anything).
+#    The Clawbernetes operator runs inside it and watches for these resources.
+#
+# 5. Install the Clawbernetes operator:
+#      kubectl apply -f https://clawbernetes.io/install.yaml
+#
+# Once all of that is in place, everything below is the ONLY thing you need
+# to touch to deploy, update, or govern your entire agent fleet.
+# =============================================================================
+
+
+# =============================================================================
+# PRIMITIVE 1: ClawGateway
+# =============================================================================
+# The ClawGateway is a cluster-wide (or per-node) proxy that sits between
+# every agent and the outside world — LLM APIs, external tools, databases.
+#
+# This is the observeclaw logic promoted to a first-class infrastructure
+# primitive. Instead of configuring observeclaw per-agent on each machine,
+# you declare one gateway and every ClawAgent in the cluster routes through it.
+#
+# Topology options:
+#   centralized — one gateway pod for the whole cluster. Best when all agents
+#                 run on networked nodes. Gives you a single telemetry stream,
+#                 single routing brain, single place to update policies.
+#   sidecar     — one gateway container injected per agent pod. Best when
+#                 agents run on isolated DGX nodes with no shared network.
+#                 Each agent is self-contained. Logs are aggregated separately.
+#
+# The gateway handles:
+#   - Model routing (route complex queries to claude, simple to haiku, etc.)
+#   - Budget enforcement (downgrade model when agent approaches spend limit)
+#   - PII redaction (strip SSNs, emails, credit cards before they hit any LLM)
+#   - Prompt injection blocking (regex patterns catch rm -rf, sudo, jailbreaks)
+#   - LlamaGuard safety classification (local Ollama model, ~200ms latency)
+#   - Anomaly detection (spend spikes, error loops, idle burn, token inflation)
+#   - Webhook alerting (Slack for warnings, PagerDuty for critical incidents)
+# =============================================================================
+
+apiVersion: clawbernetes.io/v1
+kind: ClawGateway
+metadata:
+  name: main-gateway
+  namespace: clawbernetes
+spec:
+
+  # Centralized means one gateway for the whole cluster.
+  # Change to "sidecar" if agents are on isolated bare metal nodes.
+  topology: centralized
+
+  # The port the gateway listens on inside the cluster.
+  # All ClawAgent pods route their LLM calls here automatically.
+  port: 8443
+
+  # --- Model Routing Pipeline ---
+  # This is the observeclaw routing logic declared as infrastructure.
+  # Evaluators run in priority order (highest first). First match wins.
+  # Each evaluator can block, proxy, or route to a different model.
+  routing:
+    enabled: true
+    logEveryDecision: true  # Every routing decision gets logged. Good for audits.
+
+    evaluators:
+
+      # Block dangerous shell injection patterns instantly with regex.
+      # This runs in ~0ms — pure string matching, no LLM call needed.
+      # Catches the most obvious attacks: rm -rf, curl | sh, jailbreak prompts.
+      - name: exec-injection-blocker
+        type: regex
+        priority: 100
+        patterns:
+          - "\\b(rm\\s+-rf|sudo\\s+|chmod\\s+777)"
+          - "\\b(curl\\s+.*\\|\\s*sh|wget\\s+.*\\|\\s*bash)"
+          - "ignore\\s+(all\\s+)?previous\\s+instructions"
+          - "you\\s+are\\s+now\\s+(a|an)\\s+"
+          - "\\[SYSTEM\\]|\\[INST\\]"
+        action: block
+        blockReply: "Blocked: command injection or prompt manipulation detected."
+        emitEvent: true  # Fires a Kubernetes event so you can see it in kubectl
+
+      # Run LlamaGuard (local Ollama model) for broader safety classification.
+      # This is the second line of defense — catches things regex misses.
+      # Runs locally so no PII ever leaves your cluster for safety checks.
+      - name: llamaguard-safety
+        type: classifier
+        priority: 95
+        classifierModel: llama-guard3:1b
+        ollamaEndpoint: http://localhost:11434
+        action: block
+        blockReply: "Blocked by safety classifier."
+        timeoutMs: 2000
+        emitEvent: true
+
+      # Strip PII before it reaches any external LLM API.
+      # Detected via regex, routed through a local redaction proxy that
+      # replaces sensitive values with [PII-REDACTED] before forwarding.
+      # A webhook also fires to your SIEM for compliance audit trails.
+      - name: pii-proxy
+        type: regex
+        priority: 90
+        patterns:
+          - "\\b\\d{3}-\\d{2}-\\d{4}\\b"                              # SSN
+          - "[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}"                  # Email
+          - "\\b\\d{4}[\\s-]?\\d{4}[\\s-]?\\d{4}[\\s-]?\\d{4}\\b"   # Credit card
+        action: proxy
+        proxyUrl: http://localhost:8444  # Local redaction proxy, never external
+        redactReplacement: "[PII-REDACTED]"
+        emitEvent: true
+        webhooks:
+          - url: "https://dlp-siem.internal/ingest"  # Compliance audit trail
+
+      # Route based on query complexity — save money on simple tasks,
+      # use powerful models only when actually needed.
+      # The complexity classifier runs locally (~7ms) to avoid latency.
+      - name: complexity-router
+        type: classifier
+        priority: 50
+        classifierModel: query-complexity
+        classifierEndpoint: http://localhost:8443/v1/chat/completions
+        routes:
+          simple:
+            provider: anthropic
+            model: claude-haiku-4-5   # Fast and cheap for simple queries
+          complex:
+            provider: anthropic
+            model: claude-sonnet-4-6  # Full power for complex reasoning
+        timeoutMs: 3000
+
+  # --- Anomaly Detection ---
+  # The gateway watches every agent's behavior continuously.
+  # These thresholds define what "abnormal" looks like.
+  # When triggered, alerts fire to the webhook targets below.
+  anomaly:
+    # Alert if an agent's hourly spend is 3x its 7-day average.
+    # Catches runaway loops or prompt injection that's burning budget.
+    spendSpikeMultiplier: 3
+
+    # Alert if an agent is calling the LLM for 10 minutes straight
+    # with no useful output. Classic sign of a stuck loop.
+    idleBurnMinutes: 10
+
+    # Auto-pause the agent after 10 consecutive LLM errors.
+    # Prevents an agent in a bad state from burning credits infinitely.
+    errorLoopThreshold: 10
+
+    # Alert if average input tokens doubled recently.
+    # Could mean prompt injection is stuffing the context window.
+    tokenInflationMultiplier: 2
+
+    # How often the anomaly detectors run. 30s is a good balance.
+    checkIntervalSeconds: 30
+
+  # --- Alerting Webhooks ---
+  # Where anomaly alerts and block events get sent.
+  # Supports any webhook — Slack, PagerDuty, custom SIEM.
+  webhooks:
+    - url: "https://hooks.slack.com/services/xxx"
+      minSeverity: warning   # Warnings and above go to Slack
+    - url: "https://events.pagerduty.com/v2/enqueue"
+      minSeverity: critical  # Only critical incidents wake someone up
+      headers:
+        Authorization: "Token token=your-pagerduty-key"
+
+---
+
+# =============================================================================
+# PRIMITIVE 2: ClawPolicy
+# =============================================================================
+# A ClawPolicy is a reusable, versioned ruleset that defines what an agent
+# is allowed to do. It is separate from the agent itself because the same
+# policy should apply to many agents — and you should be able to update
+# it once and have it propagate across the entire fleet automatically.
+#
+# This solves the real problem: right now, a founder with 15 DGX nodes
+# running OpenClaw agents has no way to enforce "no agent can ever run
+# DROP TABLE" across all of them at once. They'd have to SSH into each
+# machine and hope the ansible playbook ran correctly.
+#
+# With ClawPolicy, you update one resource. The operator reconciles every
+# agent that references it. Done.
+#
+# Tool policies map directly to OpenClaw's tool system — the same tool names
+# you see in TOOLS.md get allow/deny listed here.
+# =============================================================================
+
+apiVersion: clawbernetes.io/v1
+kind: ClawPolicy
+metadata:
+  name: engineering-policy
+  namespace: clawbernetes
+spec:
+
+  # --- Tool Policy ---
+  # Controls which OpenClaw tools an agent is allowed to use.
+  # "allow" is a whitelist — only these tools are permitted.
+  # "deny" is a blacklist — everything else is allowed except these.
+  # Use allow for high-security agents, deny for general purpose agents.
+  toolPolicy:
+    deny:
+      - exec        # No arbitrary shell execution
+      - shell       # No shell access
+      - bash        # No bash directly
+      # Note: we do NOT deny file reading — engineers need that.
+      # The gateway's regex blocker catches dangerous patterns at the message
+      # level before they ever reach a tool call.
+
+  # --- Budget Enforcement ---
+  # Per-agent spend limits enforced by the gateway.
+  # When an agent hits warnAt% of its limit, the gateway automatically
+  # downgrades it to the cheaper model defined below.
+  # When it hits 100%, calls are blocked until the period resets.
+  budget:
+    daily: 500          # USD per day
+    monthly: 10000      # USD per month
+    warnAt: 0.9         # Downgrade at 90% of limit
+    downgradeModel: claude-haiku-4-5
+    downgradeProvider: anthropic
+
+---
+
+apiVersion: clawbernetes.io/v1
+kind: ClawPolicy
+metadata:
+  name: intern-policy
+  namespace: clawbernetes
+spec:
+  toolPolicy:
+    allow:              # Interns get a strict whitelist — only these tools
+      - search
+      - read_file
+      - send_message
+      # No exec, no shell, no file writes, no database access
+  budget:
+    daily: 5
+    monthly: 100
+    warnAt: 0.5         # Downgrade early — interns don't need the big model
+
+---
+
+# =============================================================================
+# PRIMITIVE 3: ClawSkillSet
+# =============================================================================
+# In OpenClaw, skills live as SKILL.md files in directories that get loaded
+# at agent startup. Right now, if you want a specific agent to have specific
+# skills, you manually copy files to the right directory on the right machine.
+# At fleet scale this is unmanageable.
+#
+# ClawSkillSet declares a named, versioned collection of skills as a
+# Kubernetes resource. The operator mounts them into the agent's skill
+# directory automatically — as a ConfigMap or a volume, depending on size.
+#
+# This also enables skill distribution: you can give different agents
+# different skill sets, creating genuine specialization across your fleet.
+# An eng-agent gets coding skills. A sales-agent gets CRM skills.
+# They're different. They know different things.
+#
+# Skills are loaded by OpenClaw from:
+#   src/agents/skills/workspace.ts → loadWorkspaceSkillEntries()
+# Which scans the agent's skill directories at startup.
+# The operator writes ClawSkillSet contents to those directories before
+# the agent process starts.
+# =============================================================================
+
+apiVersion: clawbernetes.io/v1
+kind: ClawSkillSet
+metadata:
+  name: engineering-skills
+  namespace: clawbernetes
+spec:
+  skills:
+    - name: kubernetes-debugging
+      content: |
+        # Kubernetes Debugging
+        When debugging a Kubernetes issue, always start with kubectl describe
+        before kubectl logs. Check events first. Never kubectl delete a pod
+        you haven't diagnosed yet.
+
+    - name: database-safety
+      content: |
+        # Database Safety
+        Never run DROP, TRUNCATE, or DELETE without a WHERE clause.
+        Always run SELECT first to verify what you're about to modify.
+        For schema changes, always use migrations, never raw ALTER TABLE in prod.
+
+    - name: code-review
+      content: |
+        # Code Review Standards
+        Check for: missing error handling, hardcoded secrets, SQL injection
+        vectors, missing input validation. Always comment on test coverage.
+
+---
+
+apiVersion: clawbernetes.io/v1
+kind: ClawSkillSet
+metadata:
+  name: sales-skills
+  namespace: clawbernetes
+spec:
+  skills:
+    - name: crm-workflow
+      content: |
+        # CRM Workflow
+        Always log contact attempts within 24 hours. Use the standard
+        follow-up sequence: day 1, day 3, day 7, day 14. Never mark a
+        lead as closed-lost without a reason code.
+
+    - name: outreach-templates
+      content: |
+        # Outreach Standards
+        Subject lines under 50 characters. First line personalised.
+        No attachments on cold outreach. Always include an unsubscribe option.
+
+---
+
+# =============================================================================
+# PRIMITIVE 4: ClawConnector
+# =============================================================================
+# A ClawConnector declares an external service that an agent is allowed
+# to reach. This is the "connectors gated through a primitive" idea.
+#
+# Right now, if an agent needs to talk to a database or an external API,
+# you either hardcode the credentials in the agent config or pass them
+# as environment variables manually. There's no central record of which
+# agent connects to which service, no way to revoke access at the cluster
+# level, and no audit trail.
+#
+# ClawConnector solves this. Every external dependency is declared.
+# The operator injects the credentials as environment variables into the
+# agent pod from Kubernetes Secrets — never hardcoded, never in plaintext.
+# The gateway enforces that the agent can only reach declared connectors.
+# =============================================================================
+
+apiVersion: clawbernetes.io/v1
+kind: ClawConnector
+metadata:
+  name: production-postgres
+  namespace: clawbernetes
+spec:
+  type: database
+  driver: postgresql
+  host: postgres.internal
+  port: 5432
+  database: production
+
+  # Credentials come from a Kubernetes Secret — never hardcoded in YAML.
+  # The operator injects these as env vars into the agent pod at runtime.
+  credentialsSecret: postgres-credentials  # kubectl create secret generic postgres-credentials ...
+
+  # Access controls — what the agent is allowed to do on this connector.
+  # The gateway enforces these at the tool call level.
+  permissions:
+    - SELECT   # Can read
+    # No INSERT, UPDATE, DELETE, DROP — read-only connector for this agent
+
+---
+
+apiVersion: clawbernetes.io/v1
+kind: ClawConnector
+metadata:
+  name: crm-api
+  namespace: clawbernetes
+spec:
+  type: http
+  baseUrl: https://api.crm.internal
+  credentialsSecret: crm-api-key
+  rateLimit:
+    requestsPerMinute: 60  # Don't let the agent hammer the CRM
+
+---
+
+# =============================================================================
+# PRIMITIVE 5: ClawObservability
+# =============================================================================
+# ClawObservability is the telemetry stack declared as a first-class primitive.
+# The operator reads this resource and deploys the entire observability
+# infrastructure inside the cluster — Grafana Tempo as the OTLP collector,
+# Grafana as the visualization layer, and pre-built dashboards for agent fleets.
+#
+# This is the "no external dependencies" guarantee.
+# No orq.ai account. No Datadog. No external SaaS.
+# Everything runs inside your cluster, on your hardware, under your control.
+#
+# Every ClawAgent that references this resource gets its OTEL endpoint
+# injected automatically. You never configure telemetry per-agent manually.
+# Change the ClawObservability resource and it propagates to the entire fleet.
+#
+# What you see in Grafana out of the box:
+#   - Per-agent token usage over time
+#   - Per-agent cost over time (USD)
+#   - Per-agent LLM call latency (p50, p95, p99)
+#   - Anomaly events (spend spikes, error loops, idle burn)
+#   - Live trace waterfall for any agent run
+#   - Side-by-side fleet comparison — all agents in one view
+#
+# The demo moment: two agents running, both streaming to the same Grafana
+# dashboard. You can see eng-agent and sales-agent side by side, their spend,
+# their call volume, their latency. That's the fleet visibility story made
+# visual and legible to any judge in under 10 seconds.
+#
+# Internally the operator deploys:
+#   - Grafana Tempo (OTLP receiver on port 4318)        ← agents write here
+#   - Grafana (dashboard UI on port 3000)               ← you read here
+#   - A ConfigMap with pre-built agent fleet dashboards ← zero manual setup
+# All within the clawbernetes namespace. No Helm charts you touch manually.
+# =============================================================================
+
+apiVersion: clawbernetes.io/v1
+kind: ClawObservability
+metadata:
+  name: fleet-observability
+  namespace: clawbernetes
+spec:
+
+  # --- Tempo (OTLP Collector) ---
+  # Grafana Tempo receives all OTLP traces and metrics from every agent.
+  # The operator deploys it as a Deployment + Service inside the cluster.
+  # Agents write to it via http/protobuf on port 4318 — the OTLP standard.
+  tempo:
+    enabled: true
+    # How long to retain trace data. 7 days is enough for fleet debugging.
+    # Increase for compliance use cases. Stored on a PersistentVolumeClaim.
+    retentionDays: 7
+    storage:
+      size: 10Gi          # PVC size for trace storage
+      storageClass: ""    # Leave empty to use cluster default StorageClass
+
+  # --- Grafana (Visualization) ---
+  # The operator deploys Grafana pre-configured with Tempo as a datasource
+  # and a set of built-in dashboards for OpenClaw agent fleets.
+  # Access via kubectl port-forward or expose as a LoadBalancer/Ingress.
+  grafana:
+    enabled: true
+    # Pre-built dashboards the operator installs automatically.
+    # These are ConfigMaps containing Grafana dashboard JSON — no manual import.
+    dashboards:
+      - fleet-overview      # All agents side by side: cost, tokens, latency
+      - agent-detail        # Drill-down into a single agent's trace waterfall
+      - anomaly-feed        # Live feed of anomaly events across the fleet
+      - budget-tracker      # Spend vs. limit per agent, per day and per month
+
+    # Admin credentials — stored as a Kubernetes Secret by the operator.
+    # Change these before exposing Grafana outside the cluster.
+    adminCredentialsSecret: grafana-admin-credentials
+
+    # How to access Grafana from outside the cluster.
+    # "port-forward" means no Service is exposed — use kubectl port-forward.
+    # "loadbalancer" creates a LoadBalancer Service (needs cloud provider).
+    # "ingress" creates an Ingress resource (needs ingress controller).
+    expose: port-forward    # Safe default for hackathon / bare metal demo
+
+  # --- Fleet-wide OTLP endpoint ---
+  # This is what every ClawAgent in the cluster points at for telemetry.
+  # The operator injects this automatically into every agent's OTEL config.
+  # You never write an endpoint URL in a ClawAgent — you just reference
+  # this ClawObservability resource and the operator handles the rest.
+  otlpEndpoint: "http://tempo.clawbernetes.svc.cluster.local:4318"
+  otlpProtocol: http/protobuf
+
+---
+
+# =============================================================================
+# PRIMITIVE 6: ClawAgent
+# =============================================================================
+# This is the core primitive. Everything above is referenced here.
+# A ClawAgent is the full declaration of a single autonomous agent —
+# its identity, its soul, its skills, its policy, its connectors,
+# its observability stack, and its resource allocation.
+#
+# The operator reads this resource and:
+#   1. Creates a Pod running the orq.ai OpenClaw fork (Dockerfile already ships in the repo)
+#   2. Seeds the workspace with the declared SOUL.md, IDENTITY.md, USER.md
+#      (these are the files OpenClaw reads from ~/.openclaw/workspace/ —
+#       seeded by ensureAgentWorkspace() in src/agents/workspace.ts)
+#   3. Mounts the referenced ClawSkillSet into the agent's skills directory
+#      (skills live in ~/.openclaw/workspace/skills/<skill>/SKILL.md —
+#       loaded by loadWorkspaceSkillEntries() in src/agents/skills/workspace.ts)
+#   4. Injects the ClawPolicy into the observeclaw plugin config as a ConfigMap
+#   5. Injects ClawConnector credentials as environment variables from Secrets
+#   6. Reads the ClawObservability resource and injects the OTLP endpoint +
+#      enables diagnostics-otel plugin automatically — no manual plugin enable
+#   7. Routes all LLM calls through the referenced ClawGateway
+#
+# The result: one YAML file. One agent. Fully governed. Fully observable.
+# No ansible. No SSH. No manually placed markdown files on bare metal.
+# Apply it to any cluster — kind on a laptop, k3s on a DGX, GKE in the cloud.
+# The agent comes up identical every time.
+# =============================================================================
+
+apiVersion: clawbernetes.io/v1
+kind: ClawAgent
+metadata:
+  name: eng-agent
+  namespace: clawbernetes
+  labels:
+    team: engineering
+    tier: senior
+spec:
+
+  # --- Identity ---
+  # This is the agent's soul — who it is, how it thinks, what it values.
+  # In raw OpenClaw, this lives as SOUL.md in ~/.openclaw/workspace/
+  # seeded from docs/reference/templates/SOUL.md at first run.
+  # Here it's declared in YAML and the operator writes it to the workspace
+  # before the agent process starts. Changing it here and re-applying
+  # updates the agent's identity on next restart.
+  identity:
+    soul: |
+      You are a senior software engineer with deep expertise in distributed
+      systems and Kubernetes. You are methodical, cautious with production
+      systems, and always verify before you modify. You never run destructive
+      commands without first understanding the blast radius.
+
+    # USER.md tells the agent about the human it works with.
+    # In raw OpenClaw this is manually written and lives in the workspace.
+    # Here it's declared and versioned alongside everything else.
+    user: |
+      Your operator is an infrastructure engineer who prefers concise,
+      technical responses. Skip the pleasantries. Show your work.
+      Prefer kubectl and CLI output over prose explanations.
+
+    # IDENTITY.md is the agent's persistent self-concept across sessions.
+    # It shapes how the agent introduces itself and frames its capabilities.
+    agentIdentity: |
+      I am eng-agent, the infrastructure specialist for this cluster.
+      I have deep knowledge of this codebase and its deployment patterns.
+      I operate with production access and treat that responsibility seriously.
+
+  # --- Skills ---
+  # Reference to the ClawSkillSet this agent loads at startup.
+  # The operator mounts these into the agent's skill directory.
+  # Different agents get different skill sets — this is what creates
+  # genuine specialization across the fleet. Not all agents know the same things.
+  skillSet: engineering-skills  # References the ClawSkillSet defined above
+
+  # --- Policy ---
+  # Reference to the ClawPolicy that governs this agent's behavior.
+  # Changing the policy resource propagates to all agents that reference it.
+  # No need to touch individual agents when policy changes.
+  policy: engineering-policy  # References the ClawPolicy defined above
+
+  # --- Connectors ---
+  # The external services this agent is allowed to reach.
+  # The gateway blocks any outbound call to a service not listed here.
+  # Credentials are injected from the referenced Kubernetes Secrets.
+  connectors:
+    - production-postgres  # Read-only DB access as declared in ClawConnector
+
+  # --- Gateway ---
+  # Which ClawGateway routes this agent's LLM calls.
+  # All model routing, PII redaction, and anomaly detection happens here.
+  gateway: main-gateway
+
+  # --- Observability ---
+  # Reference to the ClawObservability resource.
+  # The operator reads the OTLP endpoint from there and injects it into
+  # this agent's OTEL config automatically. You never hardcode endpoints here.
+  # Swap the observability stack cluster-wide by updating one resource.
+  observability: fleet-observability
+
+  # Content capture — controls whether LLM message content appears in spans.
+  # Kept here per-agent because sensitivity varies — eng-agent might want
+  # tool definitions captured, sales-agent might not want any content captured.
+  telemetryCapture:
+    inputMessages: false
+    outputMessages: false
+    systemInstructions: false
+    toolDefinitions: true   # Safe — just tool schemas, not PII
+    toolContent: false
+    sampleRate: 1.0         # 100% trace sampling for this agent
+
+  # --- Model ---
+  # The default model this agent uses for LLM calls.
+  # The gateway's complexity-router may override this per-request.
+  # Uses the orq.ai provider which gives access to 45+ models via one API key.
+  model:
+    provider: anthropic
+    name: claude-sonnet-4-6
+    # Fallback if primary provider is unavailable
+    fallback:
+      provider: anthropic
+      name: claude-haiku-4-5
+
+  # --- Resources ---
+  # Kubernetes resource requests and limits for the agent pod.
+  # For DGX nodes, you'd add GPU resource requests here.
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "500m"
+    limits:
+      memory: "2Gi"
+      cpu: "2"
+    # Uncomment for GPU nodes:
+    # gpu:
+    #   vendor: nvidia
+    #   count: 1
+
+  # --- Lifecycle ---
+  # Controls how the operator manages this agent's lifecycle.
+  # restartPolicy: Always means the operator brings it back if it crashes.
+  # hibernateAfterIdleMinutes: operator scales it to zero when idle,
+  # resumes it instantly when a new task arrives. Saves GPU hours.
+  lifecycle:
+    restartPolicy: Always
+    hibernateAfterIdleMinutes: 30  # Scale to zero after 30min idle
+    maxRuntime: 24h                # Hard cap — restart after 24h regardless
+
+---
+
+# =============================================================================
+# SECOND AGENT — demonstrating fleet differentiation
+# =============================================================================
+# This is the point. Two agents. Different souls. Different skills.
+# Different policies. Different connectors. Both governed centrally.
+# Both streaming telemetry to the same Grafana dashboard inside the cluster.
+# Declared entirely in YAML. No ansible. No SSH. No manual file placement.
+# Apply to kind on a laptop or k3s on a DGX — identical result either way.
+# =============================================================================
+
+apiVersion: clawbernetes.io/v1
+kind: ClawAgent
+metadata:
+  name: sales-agent
+  namespace: clawbernetes
+  labels:
+    team: sales
+    tier: outreach
+spec:
+  identity:
+    soul: |
+      You are a senior sales development representative. You are concise,
+      personable, and always lead with value. You never send generic outreach.
+      Every message you write is specific to the recipient's context.
+    user: |
+      Your operator manages outreach campaigns. Prioritise reply rate over
+      volume. Quality over quantity. Flag anything that feels spammy.
+    agentIdentity: |
+      I am sales-agent, specialised in outreach and CRM workflow management.
+
+  skillSet: sales-skills        # Different skills from eng-agent
+  policy: intern-policy         # Tighter budget — sales doesn't need GPUs
+  connectors:
+    - crm-api                   # CRM access, no database access
+  gateway: main-gateway         # Same gateway — same governance layer
+
+  observability: fleet-observability
+  telemetryCapture:
+    inputMessages: false
+    outputMessages: false
+    systemInstructions: false
+    toolDefinitions: false  # Sales agent — extra conservative, no content captured
+    toolContent: false
+    sampleRate: 0.5         # 50% sampling — lower volume agent
+
+  model:
+    provider: anthropic
+    name: claude-haiku-4-5  # Cheaper model — sales tasks don't need sonnet
+    fallback:
+      provider: anthropic
+      name: claude-haiku-4-5
+
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "1Gi"
+      cpu: "1"
+
+  lifecycle:
+    restartPolicy: Always
+    hibernateAfterIdleMinutes: 60  # Sales agent can sleep longer between tasks
+
+# =============================================================================
+# END OF MANIFEST
+# =============================================================================
+# To apply everything:
+#   kubectl apply -f clawbernetes-vision.yaml
+#
+# To check agent status:
+#   kubectl get clawagents -n clawbernetes
+#   kubectl get clawobservability -n clawbernetes
+#
+# To open Grafana:
+#   kubectl port-forward svc/grafana 3000:3000 -n clawbernetes
+#   open http://localhost:3000
+#
+# To update a policy across the whole fleet:
+#   Edit the ClawPolicy resource and kubectl apply
+#   The operator reconciles all agents that reference it. Done.
+#
+# To add a new agent to the fleet:
+#   Copy a ClawAgent block, change the name and soul, kubectl apply.
+#   No new infrastructure. No ansible. No SSH.
+# =============================================================================
+
+
+# =============================================================================
+# DEMO FLOW — 90 SECONDS, JUDGE-FACING
+# =============================================================================
+#
+# This is the exact sequence on screen during the pitch.
+# Lock this before writing a single line of operator code.
+#
+# [0:00] Terminal — single command:
+#   kubectl apply -f clawbernetes-vision.yaml
+#   Output: 6 resources created (ClawGateway, ClawPolicy x2, ClawSkillSet x2,
+#           ClawConnector x2, ClawObservability, ClawAgent x2)
+#
+# [0:15] Terminal — watch the operator work:
+#   kubectl get pods -n clawbernetes -w
+#   Grafana Tempo comes up. Grafana comes up. eng-agent pod comes up.
+#   sales-agent pod comes up. All Running.
+#
+# [0:30] Terminal — show agent seeding happened:
+#   kubectl exec eng-agent -n clawbernetes -- cat ~/.openclaw/workspace/SOUL.md
+#   Shows the soul content declared in the YAML — not a template, the exact text.
+#   kubectl exec eng-agent -n clawbernetes -- ls ~/.openclaw/workspace/skills/
+#   Shows kubernetes-debugging, database-safety, code-review mounted as skill dirs.
+#
+# [0:50] Browser — Grafana fleet dashboard:
+#   http://localhost:3000 (kubectl port-forward already running)
+#   Fleet overview dashboard: eng-agent and sales-agent side by side.
+#   Both showing live token usage, cost, latency as agents handle tasks.
+#   Point at the dashboard: "This is what every DGX founder needs.
+#   Right now they have ansible and hope. We give them this."
+#
+# [1:10] One-liner closer:
+#   "One YAML file. Any machine. Any cluster. Full fleet visibility.
+#    No ansible. No SSH. No manually placed markdown files on bare metal."
+#
+# =============================================================================
+# IMPLEMENTATION NOTES FOR THE OPERATOR (what the agent building this needs)
+# =============================================================================
+#
+# LANGUAGE: Go. Use kubebuilder v4 to scaffold.
+#   kubebuilder init --domain clawbernetes.io --repo github.com/clawbernetes/operator
+#   kubebuilder create api --group claw --version v1 --kind ClawAgent
+#   kubebuilder create api --group claw --version v1 --kind ClawGateway
+#   kubebuilder create api --group claw --version v1 --kind ClawPolicy
+#   kubebuilder create api --group claw --version v1 --kind ClawSkillSet
+#   kubebuilder create api --group claw --version v1 --kind ClawConnector
+#   kubebuilder create api --group claw --version v1 --kind ClawObservability
+#
+# CONTAINER IMAGE: The orq.ai fork ships a Dockerfile already.
+#   git clone --recurse-submodules https://github.com/orq-ai/openclaw.git
+#   docker build -t clawbernetes/openclaw:latest .
+#   The operator uses this image for every ClawAgent pod it creates.
+#   No custom image needed — just the upstream fork image.
+#
+# WORKSPACE SEEDING: The operator runs an init container before OpenClaw starts.
+#   Init container writes SOUL.md, IDENTITY.md, USER.md from ClawAgent spec
+#   into a shared emptyDir volume at /root/.openclaw/workspace/.
+#   Main container (OpenClaw) starts after init completes — reads files as normal.
+#   OpenClaw's ensureAgentWorkspace() uses writeFileIfMissing (wx flag) so it
+#   won't overwrite what the init container already placed.
+#
+# SKILL MOUNTING: ClawSkillSet contents become a ConfigMap.
+#   Each skill entry becomes one key in the ConfigMap (key = skill name + /SKILL.md).
+#   Mounted as a volume into the agent pod at:
+#   /root/.openclaw/workspace/skills/<skill-name>/SKILL.md
+#   OpenClaw's loadWorkspaceSkillEntries() scans this directory at startup.
+#
+# POLICY INJECTION: ClawPolicy becomes an observeclaw plugin ConfigMap.
+#   The operator renders the observeclaw YAML from the ClawPolicy spec
+#   and mounts it at /root/.openclaw/plugins/observeclaw/config.yaml.
+#   The gateway picks it up on start via openclaw plugins enable observeclaw.
+#
+# OBSERVABILITY: ClawObservability controller deploys Tempo + Grafana.
+#   Use official Grafana/Tempo container images — no custom builds.
+#   Tempo: grafana/tempo:latest, port 4318 (OTLP HTTP)
+#   Grafana: grafana/grafana:latest, port 3000
+#   Pre-built dashboard JSONs embedded in the operator binary as go:embed.
+#   The operator creates a ConfigMap for each dashboard and mounts into Grafana
+#   at /etc/grafana/provisioning/dashboards/ — Grafana auto-imports them.
+#   Datasource (Tempo) provisioned via /etc/grafana/provisioning/datasources/.
+#
+# OTEL INJECTION INTO OPENCLAW: The operator sets environment variables on
+#   the ClawAgent pod that the diagnostics-otel plugin reads:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo.clawbernetes.svc.cluster.local:4318
+#   OTEL_EXPORTER_OTLP_HEADERS=""  (empty — no auth needed for in-cluster Tempo)
+#   OTEL_SERVICE_NAME=<agent metadata.name>
+#   Plus in openclaw.json ConfigMap: diagnostics.enabled=true, otel.enabled=true.
+#
+# KIND CLUSTER SETUP for demo:
+#   kind create cluster --name clawbernetes
+#   kubectl create namespace clawbernetes
+#   make deploy  (kubebuilder generates this — deploys operator into cluster)
+#   kubectl apply -f clawbernetes-vision.yaml
+#   kubectl port-forward svc/grafana 3000:3000 -n clawbernetes &
+#
+# MINIMUM VIABLE DEMO SCOPE (8 hours, solo):
+#   Priority 1 — ClawObservability controller (Tempo + Grafana up and running)
+#   Priority 2 — ClawAgent controller (pod creation + init container seeding)
+#   Priority 3 — ClawSkillSet (ConfigMap → volume mount)
+#   Priority 4 — ClawPolicy (observeclaw config injection)
+#   Cut if needed — ClawConnector, ClawGateway (mention in pitch, skip impl)
+#   The demo works with Priority 1+2 alone. Skills make it better. Gateway is future.
+#
+# =============================================================================
