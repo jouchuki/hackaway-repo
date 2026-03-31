@@ -152,13 +152,20 @@ OPENCLAW_IMG ?= clawbernetes/openclaw:latest
 KIND_CLUSTER_NAME ?= clawbernetes
 
 .PHONY: build-openclaw-image
-build-openclaw-image: ## Clone the orq.ai OpenClaw fork, install observeclaw plugin, and build the container image.
+build-openclaw-image: ## Clone the orq.ai OpenClaw fork, install plugins (observeclaw + a2a-gateway), and build the container image.
 	$(eval TMPDIR := $(shell mktemp -d))
 	git clone https://github.com/orq-ai/openclaw.git $(TMPDIR)/openclaw
 	-cd $(TMPDIR)/openclaw && git submodule update --init --recursive 2>/dev/null || true
 	$(CONTAINER_TOOL) build -t $(OPENCLAW_IMG)-base $(TMPDIR)/openclaw
-	@printf 'FROM %s\nRUN timeout 60 openclaw plugins install observeclaw || true\n' "$(OPENCLAW_IMG)-base" > $(TMPDIR)/Dockerfile.observeclaw
-	$(CONTAINER_TOOL) build -t $(OPENCLAW_IMG) -f $(TMPDIR)/Dockerfile.observeclaw $(TMPDIR)
+	@printf 'FROM %s\n\
+RUN timeout 60 openclaw plugins install observeclaw || true\n\
+RUN mkdir -p /home/node/.openclaw/workspace/plugins \
+    && cd /home/node/.openclaw/workspace/plugins \
+    && git clone --depth 1 https://github.com/win4r/openclaw-a2a-gateway.git a2a-gateway \
+    && cd a2a-gateway \
+    && npm install --production \
+    && rm -rf .git\n' "$(OPENCLAW_IMG)-base" > $(TMPDIR)/Dockerfile.plugins
+	$(CONTAINER_TOOL) build -t $(OPENCLAW_IMG) -f $(TMPDIR)/Dockerfile.plugins $(TMPDIR)
 	rm -rf $(TMPDIR)
 
 .PHONY: load-kind

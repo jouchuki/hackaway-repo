@@ -238,6 +238,71 @@ type ClawAgentSpec struct {
 	// (e.g. telegram tokens). Mounted read-only at /home/node/.openclaw/credentials/.
 	// +optional
 	CredentialsSecret string `json:"credentialsSecret,omitempty"`
+
+	// a2a controls agent-to-agent communication via the A2A v0.3.0 protocol.
+	// When enabled, the openclaw-a2a-gateway plugin is configured with an Agent Card,
+	// and the agent can discover and communicate with peers.
+	// +optional
+	A2A A2ASpec `json:"a2a,omitempty"`
+}
+
+// A2ASpec controls agent-to-agent communication via the openclaw-a2a-gateway plugin.
+type A2ASpec struct {
+	// enabled controls whether the A2A gateway plugin is active for this agent.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// agentCardName is the display name in the A2A Agent Card.
+	// Defaults to the agent's metadata.name.
+	// +optional
+	AgentCardName string `json:"agentCardName,omitempty"`
+
+	// agentCardDescription is the human-readable description in the Agent Card.
+	// +optional
+	AgentCardDescription string `json:"agentCardDescription,omitempty"`
+
+	// skills lists the A2A skill IDs this agent advertises in its Agent Card.
+	// +optional
+	Skills []string `json:"skills,omitempty"`
+
+	// port is the A2A server port inside the pod. Default 18800.
+	// +optional
+	// +kubebuilder:default=18800
+	Port int `json:"port,omitempty"`
+
+	// peers lists other A2A agents this agent can communicate with.
+	// +optional
+	Peers []A2APeer `json:"peers,omitempty"`
+
+	// securityTokenSecret is a K8s Secret name containing the inbound auth token.
+	// The Secret must have a key named A2A_TOKEN.
+	// +optional
+	SecurityTokenSecret string `json:"securityTokenSecret,omitempty"`
+}
+
+// A2APeer defines a remote A2A agent peer.
+type A2APeer struct {
+	// name is the peer display name.
+	// +required
+	Name string `json:"name"`
+
+	// agentCardURL is the URL to the peer's Agent Card.
+	// For in-cluster peers: http://<agent-name>.<namespace>.svc.cluster.local:18800/.well-known/agent-card.json
+	// +required
+	AgentCardURL string `json:"agentCardUrl"`
+
+	// credentialsSecret is a K8s Secret name containing the peer's auth token.
+	// The Secret must have a key named A2A_TOKEN.
+	// +optional
+	CredentialsSecret string `json:"credentialsSecret,omitempty"`
+}
+
+// ResolvedPort returns the A2A port, defaulting to 18800.
+func (a A2ASpec) ResolvedPort() int {
+	if a.Port == 0 {
+		return 18800
+	}
+	return a.Port
 }
 
 // ClawAgentStatus defines the observed state of ClawAgent.

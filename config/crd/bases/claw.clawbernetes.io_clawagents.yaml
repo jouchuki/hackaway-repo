@@ -48,6 +48,66 @@ spec:
           spec:
             description: spec defines the desired state of ClawAgent
             properties:
+              a2a:
+                description: |-
+                  a2a controls agent-to-agent communication via the A2A v0.3.0 protocol.
+                  When enabled, the openclaw-a2a-gateway plugin is configured with an Agent Card,
+                  and the agent can discover and communicate with peers.
+                properties:
+                  agentCardDescription:
+                    description: agentCardDescription is the human-readable description
+                      in the Agent Card.
+                    type: string
+                  agentCardName:
+                    description: |-
+                      agentCardName is the display name in the A2A Agent Card.
+                      Defaults to the agent's metadata.name.
+                    type: string
+                  enabled:
+                    description: enabled controls whether the A2A gateway plugin is
+                      active for this agent.
+                    type: boolean
+                  peers:
+                    description: peers lists other A2A agents this agent can communicate
+                      with.
+                    items:
+                      description: A2APeer defines a remote A2A agent peer.
+                      properties:
+                        agentCardUrl:
+                          description: |-
+                            agentCardURL is the URL to the peer's Agent Card.
+                            For in-cluster peers: http://<agent-name>.<namespace>.svc.cluster.local:18800/.well-known/agent-card.json
+                          type: string
+                        credentialsSecret:
+                          description: |-
+                            credentialsSecret is a K8s Secret name containing the peer's auth token.
+                            The Secret must have a key named A2A_TOKEN.
+                          type: string
+                        name:
+                          description: name is the peer display name.
+                          type: string
+                      required:
+                      - agentCardUrl
+                      - name
+                      type: object
+                    type: array
+                  port:
+                    default: 18800
+                    description: port is the A2A server port inside the pod. Default
+                      18800.
+                    type: integer
+                  securityTokenSecret:
+                    description: |-
+                      securityTokenSecret is a K8s Secret name containing the inbound auth token.
+                      The Secret must have a key named A2A_TOKEN.
+                    type: string
+                  skills:
+                    description: skills lists the A2A skill IDs this agent advertises
+                      in its Agent Card.
+                    items:
+                      type: string
+                    type: array
+                type: object
               channels:
                 description: |-
                   channels is a list of ClawChannel resource names for delivery integrations
