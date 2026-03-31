@@ -358,6 +358,27 @@ func (r *ClawAgentReconciler) ensurePVC(ctx context.Context, owner *clawv1.ClawA
 		}
 		return err
 	}
+
+	// PVC already exists — sync owner references to match current reclaimPolicy.
+	needsUpdate := false
+	if reclaimPolicy == "delete" && len(existing.OwnerReferences) == 0 {
+		if err := ctrl.SetControllerReference(owner, existing, r.Scheme); err != nil {
+			return fmt.Errorf("adding owner reference to existing PVC: %w", err)
+		}
+		needsUpdate = true
+		log.Info("adding owner reference to PVC (reclaimPolicy changed to delete)", "pvc", pvcName)
+	} else if reclaimPolicy == "retain" && len(existing.OwnerReferences) > 0 {
+		existing.OwnerReferences = nil
+		needsUpdate = true
+		log.Info("removing owner reference from PVC (reclaimPolicy changed to retain)", "pvc", pvcName)
+	}
+
+	if needsUpdate {
+		if err := r.Update(ctx, existing); err != nil {
+			return fmt.Errorf("updating PVC owner references: %w", err)
+		}
+	}
+
 	return nil
 }
 
