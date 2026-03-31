@@ -157,9 +157,14 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	// --- Persistent workspace PVC (if configured) ---
+	// --- Workspace storage ---
 	if agent.Spec.Workspace.Mode == "persistent" {
 		if err := r.ensurePVC(ctx, agent, ns, name); err != nil {
+			return ctrl.Result{}, err
+		}
+	} else {
+		// Ephemeral mode: delete any leftover PVC from a previous persistent config.
+		if err := r.cleanupOrphanedPVC(ctx, ns, name); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -354,6 +359,22 @@ func (r *ClawAgentReconciler) ensurePVC(ctx context.Context, owner *clawv1.ClawA
 		return err
 	}
 	return nil
+}
+
+func (r *ClawAgentReconciler) cleanupOrphanedPVC(ctx context.Context, ns, name string) error {
+	log := logf.FromContext(ctx)
+	pvcName := name + "-home"
+
+	existing := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: ns}, existing); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil // No PVC to clean up
+		}
+		return err
+	}
+
+	log.Info("deleting orphaned PVC from previous persistent workspace", "pvc", pvcName)
+	return r.Delete(ctx, existing)
 }
 
 // ---------------------------------------------------------------------------
