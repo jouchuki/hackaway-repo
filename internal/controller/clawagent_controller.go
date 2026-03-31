@@ -209,7 +209,7 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// --- Agent Service ---
-	svc := r.agentService(ns, name)
+	svc := r.agentService(agent, ns, name)
 	if err := r.ensureResource(ctx, agent, svc, "agent-service"); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -627,7 +627,7 @@ func (r *ClawAgentReconciler) openclawConfigMap(agent *clawv1.ClawAgent, ns, nam
 			Labels:    agentLabels(name),
 		},
 		Data: map[string]string{
-			"openclaw.json": r.buildOpenclawConfig(agent, name, gatewayURL, otlpEndpoint, policy, gateway, channels),
+			"openclaw.json": r.buildOpenclawConfig(agent, ns, name, gatewayURL, otlpEndpoint, policy, gateway, channels),
 			"HEARTBEAT.md":  r.heartbeatMD(name),
 		},
 	}
@@ -823,6 +823,21 @@ func (r *ClawAgentReconciler) agentDeployment(p deploymentParams) *appsv1.Deploy
 		injectSecret(ch.Spec.CredentialsSecret)
 	}
 
+	// A2A gateway credentials.
+	if agent.Spec.A2A.Enabled {
+		// Add A2A port to the container.
+		a2aPort := agent.Spec.A2A.ResolvedPort()
+		mainContainer.Ports = append(mainContainer.Ports, corev1.ContainerPort{
+			Name: "a2a", ContainerPort: int32(a2aPort), Protocol: corev1.ProtocolTCP,
+		})
+		// Inject security token secret.
+		injectSecret(agent.Spec.A2A.SecurityTokenSecret)
+		// Inject peer credential secrets.
+		for _, peer := range agent.Spec.A2A.Peers {
+			injectSecret(peer.CredentialsSecret)
+		}
+	}
+
 	// --- RestartPolicy ---
 	restartPolicy := corev1.RestartPolicyAlways
 	if agent.Spec.Lifecycle.RestartPolicy != "" {
@@ -923,8 +938,17 @@ func int64Ptr(i int64) *int64 {
 // Agent Service
 // ---------------------------------------------------------------------------
 
-func (r *ClawAgentReconciler) agentService(ns, name string) *corev1.Service {
+func (r *ClawAgentReconciler) agentService(agent *clawv1.ClawAgent, ns, name string) *corev1.Service {
 	labels := agentLabels(name)
+	ports := []corev1.ServicePort{
+		{Name: "gateway", Port: int32(openclawGatewayPort), TargetPort: intstr.FromInt(openclawGatewayPort), Protocol: corev1.ProtocolTCP},
+	}
+	if agent.Spec.A2A.Enabled {
+		a2aPort := agent.Spec.A2A.ResolvedPort()
+		ports = append(ports, corev1.ServicePort{
+			Name: "a2a", Port: int32(a2aPort), TargetPort: intstr.FromInt(a2aPort), Protocol: corev1.ProtocolTCP,
+		})
+	}
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -933,9 +957,7 @@ func (r *ClawAgentReconciler) agentService(ns, name string) *corev1.Service {
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: labels,
-			Ports: []corev1.ServicePort{
-				{Name: "gateway", Port: int32(openclawGatewayPort), TargetPort: intstr.FromInt(openclawGatewayPort), Protocol: corev1.ProtocolTCP},
-			},
+			Ports:    ports,
 		},
 	}
 }
@@ -946,7 +968,7 @@ func (r *ClawAgentReconciler) agentService(ns, name string) *corev1.Service {
 
 // buildOpenclawConfig generates the full openclaw.json for the agent,
 // including the observeclaw plugin config derived from ClawPolicy + ClawGateway.
-func (r *ClawAgentReconciler) buildOpenclawConfig(agent *clawv1.ClawAgent, name, gatewayURL, otlpEndpoint string, policy *clawv1.ClawPolicy, gateway *clawv1.ClawGateway, channels []clawv1.ClawChannel) string {
+func (r *ClawAgentReconciler) buildOpenclawConfig(agent *clawv1.ClawAgent, ns, name, gatewayURL, otlpEndpoint string, policy *clawv1.ClawPolicy, gateway *clawv1.ClawGateway, channels []clawv1.ClawChannel) string {
 	cfg := map[string]any{
 		"gateway": map[string]any{
 			"port": openclawGatewayPort,
@@ -1137,10 +1159,91 @@ func (r *ClawAgentReconciler) buildOpenclawConfig(agent *clawv1.ClawAgent, name,
 		}
 	}
 
-	cfg["plugins"] = map[string]any{
+	// --- A2A gateway plugin configuration ---
+	pluginAllow := []string{}
+	if agent.Spec.A2A.Enabled {
+		a2aPort := agent.Spec.A2A.ResolvedPort()
+		cardName := agent.Spec.A2A.AgentCardName
+		if cardName == "" {
+			cardName = name
+		}
+		cardDesc := agent.Spec.A2A.AgentCardDescription
+		if cardDesc == "" {
+			cardDesc = fmt.Sprintf("Clawbernetes agent: %s", name)
+		}
+
+		// Build skills list for Agent Card.
+		a2aSkills := []map[string]any{}
+		for _, s := range agent.Spec.A2A.Skills {
+			a2aSkills = append(a2aSkills, map[string]any{
+				"id": s, "name": s, "description": s,
+			})
+		}
+		if len(a2aSkills) == 0 {
+			a2aSkills = append(a2aSkills, map[string]any{
+				"id": "chat", "name": "chat", "description": "Chat bridge",
+			})
+		}
+
+		a2aCfg := map[string]any{
+			"agentCard": map[string]any{
+				"name":        cardName,
+				"description": cardDesc,
+				"url":         fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/a2a/jsonrpc", name, ns, a2aPort),
+				"skills":      a2aSkills,
+			},
+			"server": map[string]any{
+				"host": "0.0.0.0",
+				"port": a2aPort,
+			},
+			"routing": map[string]any{
+				"defaultAgentId": name,
+			},
+		}
+
+		// Security: use ${A2A_TOKEN} from env var if security secret is configured.
+		if agent.Spec.A2A.SecurityTokenSecret != "" {
+			a2aCfg["security"] = map[string]any{
+				"inboundAuth": "bearer",
+				"token":       "${A2A_TOKEN}",
+			}
+		}
+
+		// Build peers list with ${PEER_<NAME>_TOKEN} env var placeholders.
+		if len(agent.Spec.A2A.Peers) > 0 {
+			peers := []map[string]any{}
+			for _, p := range agent.Spec.A2A.Peers {
+				peer := map[string]any{
+					"name":         p.Name,
+					"agentCardUrl": p.AgentCardURL,
+				}
+				if p.CredentialsSecret != "" {
+					envVar := fmt.Sprintf("${PEER_%s_TOKEN}", strings.ToUpper(strings.ReplaceAll(p.Name, "-", "_")))
+					peer["auth"] = map[string]any{
+						"type":  "bearer",
+						"token": envVar,
+					}
+				}
+				peers = append(peers, peer)
+			}
+			a2aCfg["peers"] = peers
+		}
+
+		pluginEntries["a2a-gateway"] = map[string]any{
+			"enabled": true,
+			"config":  a2aCfg,
+		}
+		pluginAllow = append(pluginAllow, "a2a-gateway")
+	}
+
+	pluginsCfg := map[string]any{
 		"enabled": true,
 		"entries": pluginEntries,
 	}
+	if len(pluginAllow) > 0 {
+		pluginsCfg["allow"] = pluginAllow
+	}
+	cfg["plugins"] = pluginsCfg
 
 	b, _ := json.MarshalIndent(cfg, "", "  ")
 	return string(b)
