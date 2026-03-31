@@ -73,6 +73,7 @@ rules:
 - apiGroups:
   - claw.clawbernetes.io
   resources:
+  - clawchannels
   - clawpolicies
   - clawskillsets
   verbs:

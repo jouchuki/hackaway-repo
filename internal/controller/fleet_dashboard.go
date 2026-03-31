@@ -32,7 +32,7 @@ type agentInfo struct {
 	Policy         string
 	SkillSet       string
 	Observability  string
-	Channels     []string
+	Channels       []string
 	Soul           string // first 100 chars
 	BudgetDaily    int
 	BudgetMonthly  int
