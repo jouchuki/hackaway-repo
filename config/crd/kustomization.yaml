@@ -7,7 +7,7 @@ resources:
 - bases/claw.clawbernetes.io_clawgateways.yaml
 - bases/claw.clawbernetes.io_clawpolicies.yaml
 - bases/claw.clawbernetes.io_clawskillsets.yaml
-- bases/claw.clawbernetes.io_clawconnectors.yaml
+- bases/claw.clawbernetes.io_clawchannels.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:
