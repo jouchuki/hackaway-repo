@@ -236,6 +236,72 @@ var _ = Describe("ClawAgent Controller — Workspace & Credential Security", fun
 	})
 
 	// -----------------------------------------------------------------------
+	// Test: reclaimPolicy=retain (default) — PVC has no owner reference
+	// -----------------------------------------------------------------------
+	Context("persistent workspace with reclaimPolicy=retain (default)", func() {
+		const agentName = "test-retain"
+
+		BeforeEach(func() {
+			agent := &clawv1.ClawAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: agentName, Namespace: ns},
+				Spec: clawv1.ClawAgentSpec{
+					Workspace: clawv1.WorkspaceSpec{
+						Mode:        "persistent",
+						StorageSize: "1Gi",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+			reconcileAgent(agentName)
+		})
+
+		AfterEach(func() {
+			deleteIfExists(&clawv1.ClawAgent{}, types.NamespacedName{Name: agentName, Namespace: ns})
+			deleteIfExists(&corev1.PersistentVolumeClaim{}, types.NamespacedName{Name: agentName + "-home", Namespace: ns})
+		})
+
+		It("should create PVC without owner reference", func() {
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: agentName + "-home", Namespace: ns}, pvc)).To(Succeed())
+			Expect(pvc.OwnerReferences).To(BeEmpty(), "retain PVC must have no owner references")
+		})
+	})
+
+	// -----------------------------------------------------------------------
+	// Test: reclaimPolicy=delete — PVC has owner reference (GC'd with agent)
+	// -----------------------------------------------------------------------
+	Context("persistent workspace with reclaimPolicy=delete", func() {
+		const agentName = "test-delete-policy"
+
+		BeforeEach(func() {
+			agent := &clawv1.ClawAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: agentName, Namespace: ns},
+				Spec: clawv1.ClawAgentSpec{
+					Workspace: clawv1.WorkspaceSpec{
+						Mode:          "persistent",
+						StorageSize:   "1Gi",
+						ReclaimPolicy: "delete",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+			reconcileAgent(agentName)
+		})
+
+		AfterEach(func() {
+			deleteIfExists(&clawv1.ClawAgent{}, types.NamespacedName{Name: agentName, Namespace: ns})
+			deleteIfExists(&corev1.PersistentVolumeClaim{}, types.NamespacedName{Name: agentName + "-home", Namespace: ns})
+		})
+
+		It("should create PVC with owner reference pointing to the agent", func() {
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: agentName + "-home", Namespace: ns}, pvc)).To(Succeed())
+			Expect(pvc.OwnerReferences).NotTo(BeEmpty(), "delete PVC must have owner reference")
+			Expect(pvc.OwnerReferences[0].Name).To(Equal(agentName))
+		})
+	})
+
+	// -----------------------------------------------------------------------
 	// Test: Credential security — no EnvFrom, no apiKey
 	// -----------------------------------------------------------------------
 	Context("credential security — agent has no API key access", func() {
