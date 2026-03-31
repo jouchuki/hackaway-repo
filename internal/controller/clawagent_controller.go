@@ -163,12 +163,7 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// --- Workspace storage ---
-	// Resolve the active PVC name. After a resize it may be {name}-home-v2.
-	activePVC := agent.Status.WorkspacePVC
-	if activePVC == "" && agent.Spec.Workspace.IsPersistent() {
-		activePVC = name + clawv1.PVCSuffix
-	}
-
+	var activePVC string
 	if agent.Spec.Workspace.IsPersistent() {
 		if err := r.ensurePVC(ctx, agent, ns, name); err != nil {
 			if errors.Is(err, errRequeueNeeded) {
@@ -176,21 +171,22 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			}
 			return ctrl.Result{}, err
 		}
-		// Re-read status in case ensurePVC updated it (resize).
-		activePVC = agent.Status.WorkspacePVC
-		if activePVC == "" {
-			activePVC = name + clawv1.PVCSuffix
-		}
+		activePVC = activePVCName(agent, name)
 	} else {
-		activePVC = ""
-		// Ephemeral mode: delete any leftover PVC from a previous persistent config.
 		if err := r.cleanupOrphanedPVC(ctx, ns, name); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 
 	// --- Agent Deployment ---
-	dep := r.agentDeployment(agent, ns, name, otlpEndpoint, gatewayURL, skills, activePVC)
+	dep := r.agentDeployment(deploymentParams{
+		Agent:        agent,
+		Namespace:    ns,
+		Name:         name,
+		OTLPEndpoint: otlpEndpoint,
+		GatewayURL:   gatewayURL,
+		ActivePVC:    activePVC,
+	})
 	if err := r.ensureResource(ctx, agent, dep, "agent-deployment"); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -324,49 +320,89 @@ func (r *ClawAgentReconciler) ensureResource(ctx context.Context, owner *clawv1.
 	return nil
 }
 
-func (r *ClawAgentReconciler) ensurePVC(ctx context.Context, owner *clawv1.ClawAgent, ns, name string) error {
-	log := logf.FromContext(ctx)
+// ---------------------------------------------------------------------------
+// PVC lifecycle: ensure, sync owner refs, resize, cleanup
+// ---------------------------------------------------------------------------
 
-	// Use the active PVC name from status if set (e.g. after a resize), otherwise default.
-	pvcName := owner.Status.WorkspacePVC
-	if pvcName == "" {
-		pvcName = name + clawv1.PVCSuffix
+func activePVCName(agent *clawv1.ClawAgent, name string) string {
+	if agent.Status.WorkspacePVC != "" {
+		return agent.Status.WorkspacePVC
 	}
+	return name + clawv1.PVCSuffix
+}
 
-	storageSize := owner.Spec.Workspace.ResolvedStorageSize()
-
+func buildPVC(pvcName, ns, agentName string, size resource.Quantity, ws clawv1.WorkspaceSpec) *corev1.PersistentVolumeClaim {
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pvcName,
 			Namespace: ns,
-			Labels:    agentLabels(name),
+			Labels:    agentLabels(agentName),
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			Resources: corev1.VolumeResourceRequirements{
-				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse(storageSize),
-				},
+				Requests: corev1.ResourceList{corev1.ResourceStorage: size},
 			},
 		},
 	}
-
-	if owner.Spec.Workspace.StorageClassName != nil {
-		pvc.Spec.StorageClassName = owner.Spec.Workspace.StorageClassName
+	if ws.StorageClassName != nil {
+		pvc.Spec.StorageClassName = ws.StorageClassName
 	}
+	return pvc
+}
 
-	// Only set owner reference when reclaimPolicy=delete. When retain (default),
-	// the PVC lives independently so it survives agent CR deletion.
+func buildMigrationPod(podName, ns, agentName, srcPVC, dstPVC string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: ns,
+			Labels:    agentLabels(agentName),
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsUser:  int64Ptr(1000),
+				RunAsGroup: int64Ptr(1000),
+				FSGroup:    int64Ptr(1000),
+			},
+			Containers: []corev1.Container{
+				{
+					Name:    "migrate",
+					Image:   "busybox:1.36",
+					Command: []string{"sh", "-c", "cp -a /src/. /dst/ && echo 'migration complete'"},
+					VolumeMounts: []corev1.VolumeMount{
+						{Name: "src", MountPath: "/src", ReadOnly: true},
+						{Name: "dst", MountPath: "/dst"},
+					},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{Name: "src", VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: srcPVC, ReadOnly: true},
+				}},
+				{Name: "dst", VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: dstPVC},
+				}},
+			},
+		},
+	}
+}
+
+func (r *ClawAgentReconciler) ensurePVC(ctx context.Context, owner *clawv1.ClawAgent, ns, name string) error {
+	log := logf.FromContext(ctx)
+	pvcName := activePVCName(owner, name)
+	storageSize := owner.Spec.Workspace.ResolvedStorageSize()
 	reclaimPolicy := owner.Spec.Workspace.ResolvedReclaimPolicy()
+
+	pvc := buildPVC(pvcName, ns, name, resource.MustParse(storageSize), owner.Spec.Workspace)
 	if reclaimPolicy == clawv1.ReclaimPolicyDelete {
 		if err := ctrl.SetControllerReference(owner, pvc, r.Scheme); err != nil {
 			return fmt.Errorf("setting owner reference on PVC: %w", err)
 		}
 	}
 
-	key := types.NamespacedName{Name: pvcName, Namespace: ns}
 	existing := &corev1.PersistentVolumeClaim{}
-	if err := r.Get(ctx, key, existing); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: ns}, existing); err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("creating PVC for persistent workspace", "pvc", pvcName, "reclaimPolicy", reclaimPolicy)
 			return r.Create(ctx, pvc)
@@ -374,24 +410,9 @@ func (r *ClawAgentReconciler) ensurePVC(ctx context.Context, owner *clawv1.ClawA
 		return err
 	}
 
-	// PVC already exists — sync owner references to match current reclaimPolicy.
-	needsUpdate := false
-	if reclaimPolicy == clawv1.ReclaimPolicyDelete && len(existing.OwnerReferences) == 0 {
-		if err := ctrl.SetControllerReference(owner, existing, r.Scheme); err != nil {
-			return fmt.Errorf("adding owner reference to existing PVC: %w", err)
-		}
-		needsUpdate = true
-		log.Info("adding owner reference to PVC (reclaimPolicy changed to delete)", "pvc", pvcName)
-	} else if reclaimPolicy == clawv1.ReclaimPolicyRetain && len(existing.OwnerReferences) > 0 {
-		existing.OwnerReferences = nil
-		needsUpdate = true
-		log.Info("removing owner reference from PVC (reclaimPolicy changed to retain)", "pvc", pvcName)
-	}
-
-	if needsUpdate {
-		if err := r.Update(ctx, existing); err != nil {
-			return fmt.Errorf("updating PVC owner references: %w", err)
-		}
+	// Sync owner references to match current reclaimPolicy.
+	if err := r.syncPVCOwnerRefs(ctx, owner, existing, pvcName, reclaimPolicy); err != nil {
+		return err
 	}
 
 	// Check if PVC needs resizing.
@@ -407,17 +428,39 @@ func (r *ClawAgentReconciler) ensurePVC(ctx context.Context, owner *clawv1.ClawA
 	return nil
 }
 
+func (r *ClawAgentReconciler) syncPVCOwnerRefs(ctx context.Context, owner *clawv1.ClawAgent, pvc *corev1.PersistentVolumeClaim, pvcName, reclaimPolicy string) error {
+	log := logf.FromContext(ctx)
+	needsUpdate := false
+
+	if reclaimPolicy == clawv1.ReclaimPolicyDelete && len(pvc.OwnerReferences) == 0 {
+		if err := ctrl.SetControllerReference(owner, pvc, r.Scheme); err != nil {
+			return fmt.Errorf("adding owner reference to existing PVC: %w", err)
+		}
+		needsUpdate = true
+		log.Info("adding owner reference to PVC (reclaimPolicy changed to delete)", "pvc", pvcName)
+	} else if reclaimPolicy == clawv1.ReclaimPolicyRetain && len(pvc.OwnerReferences) > 0 {
+		pvc.OwnerReferences = nil
+		needsUpdate = true
+		log.Info("removing owner reference from PVC (reclaimPolicy changed to retain)", "pvc", pvcName)
+	}
+
+	if needsUpdate {
+		return r.Update(ctx, pvc)
+	}
+	return nil
+}
+
 // resizePVC handles PVC expansion by creating a new PVC, migrating data via a
 // one-shot pod, then deleting the old PVC and updating the deployment to use
-// the new one. The deployment's volume reference uses the name from
-// status.workspacePVC so it tracks the active PVC across resizes.
+// the new one.
 //
 // State machine (reentrant across reconcile loops):
-//  1. New PVC doesn't exist         → create it, scale deployment to 0
-//  2. Migration pod doesn't exist   → create it (mounts old + new)
-//  3. Migration pod succeeded       → delete old PVC, delete pod, update status
-//  4. Migration pod failed          → delete pod, return error (retry on next reconcile)
-//  5. Migration pod still running   → wait
+//  1. Scale deployment to 0          → requeue
+//  2. New PVC doesn't exist          → create it
+//  3. Migration pod doesn't exist    → create it (mounts old + new)
+//  4. Migration pod succeeded        → delete old PVC, delete pod, update status
+//  5. Migration pod failed           → delete pod, return error
+//  6. Migration pod still running    → requeue
 func (r *ClawAgentReconciler) resizePVC(ctx context.Context, owner *clawv1.ClawAgent, oldPVC *corev1.PersistentVolumeClaim, ns, name, pvcName string, newSize resource.Quantity, reclaimPolicy string) error {
 	log := logf.FromContext(ctx)
 	newPVCName := name + clawv1.PVCResizeSuffix
@@ -438,29 +481,11 @@ func (r *ClawAgentReconciler) resizePVC(ctx context.Context, owner *clawv1.ClawA
 	}
 
 	// Step 2: Ensure new PVC exists.
-	newPVC := &corev1.PersistentVolumeClaim{}
-	if err := r.Get(ctx, types.NamespacedName{Name: newPVCName, Namespace: ns}, newPVC); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: newPVCName, Namespace: ns}, &corev1.PersistentVolumeClaim{}); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return err
 		}
-		newPVC = &corev1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      newPVCName,
-				Namespace: ns,
-				Labels:    agentLabels(name),
-			},
-			Spec: corev1.PersistentVolumeClaimSpec{
-				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-				Resources: corev1.VolumeResourceRequirements{
-					Requests: corev1.ResourceList{
-						corev1.ResourceStorage: newSize,
-					},
-				},
-			},
-		}
-		if owner.Spec.Workspace.StorageClassName != nil {
-			newPVC.Spec.StorageClassName = owner.Spec.Workspace.StorageClassName
-		}
+		newPVC := buildPVC(newPVCName, ns, name, newSize, owner.Spec.Workspace)
 		if reclaimPolicy == clawv1.ReclaimPolicyDelete {
 			if err := ctrl.SetControllerReference(owner, newPVC, r.Scheme); err != nil {
 				return fmt.Errorf("setting owner reference on new PVC: %w", err)
@@ -476,56 +501,18 @@ func (r *ClawAgentReconciler) resizePVC(ctx context.Context, owner *clawv1.ClawA
 		if !apierrors.IsNotFound(err) {
 			return err
 		}
-		migratePod = &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      migratePodName,
-				Namespace: ns,
-				Labels:    agentLabels(name),
-			},
-			Spec: corev1.PodSpec{
-				RestartPolicy: corev1.RestartPolicyNever,
-				SecurityContext: &corev1.PodSecurityContext{
-					RunAsUser:  int64Ptr(1000),
-					RunAsGroup: int64Ptr(1000),
-					FSGroup:    int64Ptr(1000),
-				},
-				Containers: []corev1.Container{
-					{
-						Name:    "migrate",
-						Image:   "busybox:1.36",
-						Command: []string{"sh", "-c", "cp -a /src/. /dst/ && echo 'migration complete'"},
-						VolumeMounts: []corev1.VolumeMount{
-							{Name: "src", MountPath: "/src", ReadOnly: true},
-							{Name: "dst", MountPath: "/dst"},
-						},
-					},
-				},
-				Volumes: []corev1.Volume{
-					{Name: "src", VolumeSource: corev1.VolumeSource{
-						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcName, ReadOnly: true},
-					}},
-					{Name: "dst", VolumeSource: corev1.VolumeSource{
-						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: newPVCName},
-					}},
-				},
-			},
-		}
 		log.Info("creating migration pod", "pod", migratePodName, "from", pvcName, "to", newPVCName)
-		return r.Create(ctx, migratePod)
+		return r.Create(ctx, buildMigrationPod(migratePodName, ns, name, pvcName, newPVCName))
 	}
 
 	// Step 4: Check migration pod status.
 	switch migratePod.Status.Phase {
 	case corev1.PodSucceeded:
 		log.Info("migration complete — cleaning up old PVC", "oldPVC", pvcName, "newPVC", newPVCName)
-		// Delete migration pod.
 		_ = r.Delete(ctx, migratePod)
-		// Delete old PVC.
 		if err := r.Delete(ctx, oldPVC); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
-		// Update status to point to new PVC. The deployment will be recreated
-		// on next reconcile with the new PVC name via openclawHomeVolume().
 		owner.Status.WorkspacePVC = newPVCName
 		log.Info("PVC resize complete", "newPVC", newPVCName, "size", newSize.String())
 		return nil
@@ -635,7 +622,21 @@ func (r *ClawAgentReconciler) openclawConfigMap(agent *clawv1.ClawAgent, ns, nam
 
 const openclawGatewayPort = 18789
 
-func (r *ClawAgentReconciler) agentDeployment(agent *clawv1.ClawAgent, ns, name, otlpEndpoint, gatewayURL string, skills []clawv1.SkillEntry, activePVC string) *appsv1.Deployment {
+type deploymentParams struct {
+	Agent        *clawv1.ClawAgent
+	Namespace    string
+	Name         string
+	OTLPEndpoint string
+	GatewayURL   string
+	ActivePVC    string
+}
+
+func (r *ClawAgentReconciler) agentDeployment(p deploymentParams) *appsv1.Deployment {
+	agent := p.Agent
+	ns := p.Namespace
+	name := p.Name
+	otlpEndpoint := p.OTLPEndpoint
+	activePVC := p.ActivePVC
 	labels := agentLabels(name)
 	replicas := int32(1)
 
