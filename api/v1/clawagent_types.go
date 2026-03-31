@@ -200,9 +200,11 @@ type ClawAgentSpec struct {
 	// +optional
 	Policy string `json:"policy,omitempty"`
 
-	// connectors is a list of ClawConnector resource names this agent can reach.
+	// channels is a list of ClawChannel resource names for delivery integrations
+	// (e.g. Telegram, Slack). The operator resolves each channel and generates
+	// the corresponding openclaw.json channels config with ${ENV_VAR} credential placeholders.
 	// +optional
-	Connectors []string `json:"connectors,omitempty"`
+	Channels []string `json:"channels,omitempty"`
 
 	// gateway references the ClawGateway resource name for LLM routing.
 	// +optional

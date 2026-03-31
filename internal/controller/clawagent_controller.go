@@ -58,6 +58,7 @@ type ClawAgentReconciler struct {
 // +kubebuilder:rbac:groups=claw.clawbernetes.io,resources=clawskillsets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=claw.clawbernetes.io,resources=clawpolicies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=claw.clawbernetes.io,resources=clawgateways,verbs=get;list;watch
+// +kubebuilder:rbac:groups=claw.clawbernetes.io,resources=clawchannels,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
@@ -144,6 +145,21 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
+	// --- Resolve ClawChannels if referenced ---
+	var channels []clawv1.ClawChannel
+	for _, chName := range agent.Spec.Channels {
+		ch := &clawv1.ClawChannel{}
+		chKey := types.NamespacedName{Name: chName, Namespace: ns}
+		if err := r.Get(ctx, chKey, ch); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+			log.Info("referenced ClawChannel not found", "name", chName)
+		} else if ch.Spec.IsEnabled() {
+			channels = append(channels, *ch)
+		}
+	}
+
 	// --- Identity ConfigMap (SOUL.md, USER.md, IDENTITY.md) ---
 	identityCM := r.identityConfigMap(agent, ns, name)
 	if err := r.ensureResource(ctx, agent, identityCM, "identity-configmap"); err != nil {
@@ -157,7 +173,7 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// --- OpenClaw config ConfigMap (openclaw.json + HEARTBEAT.md) ---
-	configCM := r.openclawConfigMap(agent, ns, name, gatewayURL, otlpEndpoint, policy, gateway)
+	configCM := r.openclawConfigMap(agent, ns, name, gatewayURL, otlpEndpoint, policy, gateway, channels)
 	if err := r.ensureResource(ctx, agent, configCM, "openclaw-config-configmap"); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -186,6 +202,7 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		OTLPEndpoint: otlpEndpoint,
 		GatewayURL:   gatewayURL,
 		ActivePVC:    activePVC,
+		Channels:     channels,
 	})
 	if err := r.ensureResource(ctx, agent, dep, "agent-deployment"); err != nil {
 		return ctrl.Result{}, err
@@ -246,7 +263,7 @@ func (r *ClawAgentReconciler) updateFleetDashboard(ctx context.Context, ns strin
 			Policy:        a.Spec.Policy,
 			SkillSet:      a.Spec.SkillSet,
 			Observability: a.Spec.Observability,
-			Connectors:    a.Spec.Connectors,
+			Channels:      a.Spec.Channels,
 			RestartPolicy: a.Spec.Lifecycle.RestartPolicy,
 			MaxRuntime:    a.Spec.Lifecycle.MaxRuntime,
 			IdleHibernate: hibernate,
@@ -602,7 +619,7 @@ func (r *ClawAgentReconciler) skillsConfigMap(ns, name string, skills []clawv1.S
 // OpenClaw config ConfigMap — openclaw.json + HEARTBEAT.md
 // ---------------------------------------------------------------------------
 
-func (r *ClawAgentReconciler) openclawConfigMap(agent *clawv1.ClawAgent, ns, name, gatewayURL, otlpEndpoint string, policy *clawv1.ClawPolicy, gateway *clawv1.ClawGateway) *corev1.ConfigMap {
+func (r *ClawAgentReconciler) openclawConfigMap(agent *clawv1.ClawAgent, ns, name, gatewayURL, otlpEndpoint string, policy *clawv1.ClawPolicy, gateway *clawv1.ClawGateway, channels []clawv1.ClawChannel) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name + "-openclaw-config",
@@ -610,7 +627,7 @@ func (r *ClawAgentReconciler) openclawConfigMap(agent *clawv1.ClawAgent, ns, nam
 			Labels:    agentLabels(name),
 		},
 		Data: map[string]string{
-			"openclaw.json": r.buildOpenclawConfig(agent, name, gatewayURL, otlpEndpoint, policy, gateway),
+			"openclaw.json": r.buildOpenclawConfig(agent, name, gatewayURL, otlpEndpoint, policy, gateway, channels),
 			"HEARTBEAT.md":  r.heartbeatMD(name),
 		},
 	}
@@ -629,6 +646,7 @@ type deploymentParams struct {
 	OTLPEndpoint string
 	GatewayURL   string
 	ActivePVC    string
+	Channels     []clawv1.ClawChannel
 }
 
 func (r *ClawAgentReconciler) agentDeployment(p deploymentParams) *appsv1.Deployment {
@@ -779,6 +797,32 @@ func (r *ClawAgentReconciler) agentDeployment(p deploymentParams) *appsv1.Deploy
 		})
 	}
 
+	// Inject secrets as env vars for ${VAR} substitution in openclaw.json.
+	// Deduplicate to avoid mounting the same secret twice.
+	injectedSecrets := map[string]bool{}
+	injectSecret := func(name string) {
+		if name == "" || injectedSecrets[name] {
+			return
+		}
+		injectedSecrets[name] = true
+		mainContainer.EnvFrom = append(mainContainer.EnvFrom, corev1.EnvFromSource{
+			SecretRef: &corev1.SecretEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: name},
+				Optional:             boolPtr(true),
+			},
+		})
+	}
+
+	// Model provider API key (direct providers only, no gateway).
+	if agent.Spec.Model.Provider != "" && p.GatewayURL == "" {
+		injectSecret(clawv1.DefaultProviderAPIKeysSecret)
+	}
+
+	// Channel credential secrets.
+	for _, ch := range p.Channels {
+		injectSecret(ch.Spec.CredentialsSecret)
+	}
+
 	// --- RestartPolicy ---
 	restartPolicy := corev1.RestartPolicyAlways
 	if agent.Spec.Lifecycle.RestartPolicy != "" {
@@ -902,7 +946,7 @@ func (r *ClawAgentReconciler) agentService(ns, name string) *corev1.Service {
 
 // buildOpenclawConfig generates the full openclaw.json for the agent,
 // including the observeclaw plugin config derived from ClawPolicy + ClawGateway.
-func (r *ClawAgentReconciler) buildOpenclawConfig(agent *clawv1.ClawAgent, name, gatewayURL, otlpEndpoint string, policy *clawv1.ClawPolicy, gateway *clawv1.ClawGateway) string {
+func (r *ClawAgentReconciler) buildOpenclawConfig(agent *clawv1.ClawAgent, name, gatewayURL, otlpEndpoint string, policy *clawv1.ClawPolicy, gateway *clawv1.ClawGateway, channels []clawv1.ClawChannel) string {
 	cfg := map[string]any{
 		"gateway": map[string]any{
 			"port": openclawGatewayPort,
@@ -924,6 +968,7 @@ func (r *ClawAgentReconciler) buildOpenclawConfig(agent *clawv1.ClawAgent, name,
 		},
 		"agents": map[string]any{
 			"defaults": map[string]any{
+				"workspace": "/home/node/.openclaw/workspace",
 				"heartbeat": map[string]any{
 					"every":           "5m",
 					"lightContext":    true,
@@ -935,6 +980,14 @@ func (r *ClawAgentReconciler) buildOpenclawConfig(agent *clawv1.ClawAgent, name,
 				{"id": name, "default": true},
 			},
 		},
+	}
+
+	// Set default model if provider and name are specified.
+	if agent.Spec.Model.Provider != "" && agent.Spec.Model.Name != "" {
+		defaults := cfg["agents"].(map[string]any)["defaults"].(map[string]any)
+		defaults["model"] = map[string]any{
+			"primary": fmt.Sprintf("%s/%s", agent.Spec.Model.Provider, agent.Spec.Model.Name),
+		}
 	}
 
 	// --- diagnostics-otel: built-in extension in the orq-ai/openclaw fork ---
@@ -981,35 +1034,83 @@ func (r *ClawAgentReconciler) buildOpenclawConfig(agent *clawv1.ClawAgent, name,
 		}
 	}
 
-	// --- Register a gateway-proxied Anthropic provider ---
+	// --- Register model providers ---
+	providers := map[string]any{}
+
+	// Register a gateway-proxied Anthropic provider if gateway is configured.
 	if gatewayURL != "" {
-		cfg["models"] = map[string]any{
-			"providers": map[string]any{
-				"gateway-anthropic": map[string]any{
-					"baseUrl": gatewayURL,
-					"api":     "anthropic-messages",
-					"apiKey":  "gateway-managed", // sentinel — gateway injects the real key server-side
-					"models": []map[string]any{
-						{
-							"id":            "claude-sonnet-4-6",
-							"name":          "Claude Sonnet 4.6 (via gateway)",
-							"reasoning":     true,
-							"input":         []string{"text"},
-							"contextWindow": 200000,
-							"maxTokens":     16384,
-						},
-						{
-							"id":            "claude-haiku-4-5",
-							"name":          "Claude Haiku 4.5 (via gateway)",
-							"reasoning":     false,
-							"input":         []string{"text"},
-							"contextWindow": 200000,
-							"maxTokens":     8192,
-						},
-					},
+		providers["gateway-anthropic"] = map[string]any{
+			"baseUrl": gatewayURL,
+			"api":     "anthropic-messages",
+			"apiKey":  "gateway-managed", // sentinel — gateway injects the real key server-side
+			"models": []map[string]any{
+				{
+					"id":            "claude-sonnet-4-6",
+					"name":          "Claude Sonnet 4.6 (via gateway)",
+					"reasoning":     true,
+					"input":         []string{"text"},
+					"contextWindow": 200000,
+					"maxTokens":     16384,
+				},
+				{
+					"id":            "claude-haiku-4-5",
+					"name":          "Claude Haiku 4.5 (via gateway)",
+					"reasoning":     false,
+					"input":         []string{"text"},
+					"contextWindow": 200000,
+					"maxTokens":     8192,
 				},
 			},
 		}
+	}
+
+	// Register direct providers based on agent model spec.
+	// Uses ${<PROVIDER_UPPER>_API_KEY} env var for credentials.
+	if agent.Spec.Model.Provider != "" {
+		providerName := agent.Spec.Model.Provider
+		apiFormat := clawv1.ProviderAPIFormats[providerName]
+		if apiFormat == "" {
+			apiFormat = "openai-responses" // safe default for unknown providers
+		}
+		baseURL := clawv1.ProviderBaseURLs[providerName]
+		if baseURL == "" {
+			baseURL = "https://api.openai.com/v1"
+		}
+		envVar := fmt.Sprintf("${%s_API_KEY}", strings.ToUpper(strings.ReplaceAll(providerName, "-", "_")))
+		providers[providerName] = map[string]any{
+			"baseUrl": baseURL,
+			"api":     apiFormat,
+			"apiKey":  envVar,
+			"models":  []map[string]any{},
+		}
+	}
+
+	if len(providers) > 0 {
+		cfg["models"] = map[string]any{"providers": providers}
+	}
+
+	// --- Channels: generate channels config from ClawChannel CRs ---
+	if len(channels) > 0 {
+		channelsCfg := map[string]any{}
+		for _, ch := range channels {
+			chCfg := map[string]any{
+				"enabled": true,
+			}
+			// Map credential secret keys to ${ENV_VAR} placeholders.
+			chType := strings.ToUpper(ch.Spec.Type)
+			if clawv1.ChannelsWithBotToken[ch.Spec.Type] {
+				chCfg["botToken"] = fmt.Sprintf("${%s_BOT_TOKEN}", chType)
+			}
+			if clawv1.ChannelsWithAppToken[ch.Spec.Type] {
+				chCfg["appToken"] = fmt.Sprintf("${%s_APP_TOKEN}", chType)
+			}
+			// Merge user-provided config (dmPolicy, groupPolicy, streaming, etc.)
+			for k, v := range ch.Spec.Config {
+				chCfg[k] = v
+			}
+			channelsCfg[ch.Spec.Type] = chCfg
+		}
+		cfg["channels"] = channelsCfg
 	}
 
 	// --- Build observeclaw plugin config from ClawPolicy + ClawGateway ---
@@ -1025,6 +1126,13 @@ func (r *ClawAgentReconciler) buildOpenclawConfig(agent *clawv1.ClawAgent, name,
 	// Enable the bundled diagnostics-otel extension.
 	if otlpEndpoint != "" {
 		pluginEntries["diagnostics-otel"] = map[string]any{
+			"enabled": true,
+		}
+	}
+
+	// Auto-enable channel plugins.
+	for _, ch := range channels {
+		pluginEntries[ch.Spec.Type] = map[string]any{
 			"enabled": true,
 		}
 	}

@@ -32,7 +32,7 @@ type agentInfo struct {
 	Policy         string
 	SkillSet       string
 	Observability  string
-	Connectors     []string
+	Channels       []string
 	Soul           string // first 100 chars
 	BudgetDaily    int
 	BudgetMonthly  int
@@ -64,14 +64,14 @@ func generateFleetDashboardHTML(agents []agentInfo) string {
 			nameColor = "#fc5185"
 		}
 
-		// Connectors
-		connectorsHTML := "<span class=\"dim\">none</span>"
-		if len(a.Connectors) > 0 {
-			escaped := make([]string, len(a.Connectors))
-			for i, c := range a.Connectors {
+		// Channels
+		channelsHTML := "<span class=\"dim\">none</span>"
+		if len(a.Channels) > 0 {
+			escaped := make([]string, len(a.Channels))
+			for i, c := range a.Channels {
 				escaped[i] = "<span class=\"tag\">" + html.EscapeString(c) + "</span>"
 			}
-			connectorsHTML = strings.Join(escaped, " ")
+			channelsHTML = strings.Join(escaped, " ")
 		}
 
 		// Tool deny
@@ -122,7 +122,7 @@ func generateFleetDashboardHTML(agents []agentInfo) string {
       <div class="field"><span class="label">Observability:</span> %s</div>
     </div>
     <div class="field-group">
-      <h4>Connectors</h4>
+      <h4>Channels</h4>
       <div class="field">%s</div>
     </div>
     <div class="field-group">
@@ -156,7 +156,7 @@ func generateFleetDashboardHTML(agents []agentInfo) string {
 			html.EscapeString(a.Policy),
 			html.EscapeString(a.SkillSet),
 			html.EscapeString(a.Observability),
-			connectorsHTML,
+			channelsHTML,
 			a.BudgetDaily,
 			a.BudgetMonthly,
 			downgradeHTML,
@@ -426,7 +426,7 @@ spec:
   policy: engineering-policy
   gateway: main-gateway
   observability: fleet-observability
-  connectors:
+  channels:
     - production-postgres
   model:
     provider: anthropic

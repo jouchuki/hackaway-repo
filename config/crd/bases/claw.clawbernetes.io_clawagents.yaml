@@ -48,9 +48,11 @@ spec:
           spec:
             description: spec defines the desired state of ClawAgent
             properties:
-              connectors:
-                description: connectors is a list of ClawConnector resource names
-                  this agent can reach.
+              channels:
+                description: |-
+                  channels is a list of ClawChannel resource names for delivery integrations
+                  (e.g. Telegram, Slack). The operator resolves each channel and generates
+                  the corresponding openclaw.json channels config with ${ENV_VAR} credential placeholders.
                 items:
                   type: string
                 type: array

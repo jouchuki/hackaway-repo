@@ -4,20 +4,29 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.1
-  name: clawconnectors.claw.clawbernetes.io
+  name: clawchannels.claw.clawbernetes.io
 spec:
   group: claw.clawbernetes.io
   names:
-    kind: ClawConnector
-    listKind: ClawConnectorList
-    plural: clawconnectors
-    singular: clawconnector
+    kind: ClawChannel
+    listKind: ClawChannelList
+    plural: clawchannels
+    singular: clawchannel
   scope: Namespaced
   versions:
-  - name: v1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.type
+      name: Type
+      type: string
+    - jsonPath: .spec.enabled
+      name: Enabled
+      type: boolean
+    name: v1
     schema:
       openAPIV3Schema:
-        description: ClawConnector is the Schema for the clawconnectors API.
+        description: |-
+          ClawChannel is the Schema for the clawchannels API.
+          It declares a delivery channel (Telegram, Slack, etc.) for agent communication.
         properties:
           apiVersion:
             description: |-
@@ -37,51 +46,54 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of ClawConnector
+            description: spec defines the desired state of ClawChannel
             properties:
-              baseUrl:
-                description: baseUrl is the base URL. Only for http type.
-                type: string
-              credentialsSecret:
-                description: credentialsSecret is the name of the Kubernetes Secret
-                  containing credentials.
-                type: string
-              database:
-                description: database is the database name. Only for database type.
-                type: string
-              driver:
-                description: driver is the database driver (e.g. "postgresql"). Only
-                  for database type.
-                type: string
-              host:
-                description: host is the database host. Only for database type.
-                type: string
-              permissions:
-                description: permissions is a list of allowed operations (e.g. SELECT,
-                  INSERT).
-                items:
+              config:
+                additionalProperties:
                   type: string
-                type: array
-              port:
-                description: port is the database port. Only for database type.
-                type: integer
-              rateLimit:
-                description: rateLimit defines rate limiting for the connector.
-                properties:
-                  requestsPerMinute:
-                    description: requestsPerMinute is the maximum number of requests
-                      per minute.
-                    type: integer
+                description: |-
+                  config holds channel-specific configuration. Keys map directly to
+                  fields in openclaw.json's channels.<type> section.
                 type: object
-              type:
-                description: type is the connector type (e.g. "database", "http").
+              credentialsSecret:
+                description: |-
+                  credentialsSecret is the name of the Kubernetes Secret containing channel
+                  credentials (e.g. bot tokens). Secret keys must use the convention
+                  <TYPE_UPPER>_BOT_TOKEN, <TYPE_UPPER>_APP_TOKEN, etc.
+                  Example: TELEGRAM_BOT_TOKEN, SLACK_BOT_TOKEN, SLACK_APP_TOKEN.
+                  These are injected as env vars and referenced via ${VAR} in openclaw.json.
                 type: string
+              enabled:
+                default: true
+                description: enabled controls whether this channel is active.
+                type: boolean
+              type:
+                description: type is the delivery channel type (telegram, slack, discord,
+                  etc.).
+                enum:
+                - telegram
+                - slack
+                - discord
+                - whatsapp
+                - matrix
+                - msteams
+                - irc
+                - signal
+                - line
+                - feishu
+                - nostr
+                - mattermost
+                - googlechat
+                type: string
+            required:
+            - credentialsSecret
+            - type
             type: object
           status:
-            description: status defines the observed state of ClawConnector
+            description: status defines the observed state of ClawChannel
             properties:
               conditions:
-                description: conditions represent the current state of the ClawConnector
+                description: conditions represent the current state of the ClawChannel
                   resource.
                 items:
                   description: Condition contains details for one aspect of the current
