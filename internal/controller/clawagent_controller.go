@@ -457,7 +457,7 @@ func (r *ClawAgentReconciler) agentDeployment(agent *clawv1.ClawAgent, ns, name,
 			"cp /identity-src/SOUL.md /openclaw-home/workspace/SOUL.md 2>/dev/null || true",
 			"cp /identity-src/USER.md /openclaw-home/workspace/USER.md 2>/dev/null || true",
 			"cp /identity-src/IDENTITY.md /openclaw-home/workspace/IDENTITY.md 2>/dev/null || true",
-			"for f in /skills-src/*; do [ -f \"$f\" ] && skill=$(basename \"$f\") && mkdir -p /openclaw-home/workspace/skills/$skill && cp \"$f\" /openclaw-home/workspace/skills/$skill/SKILL.md; done",
+			"for f in /skills-src/*; do [ -f \"$f\" ] && skill=$(basename \"$f\") && mkdir -p /openclaw-home/workspace/skills/$skill && cp \"$f\" /openclaw-home/workspace/skills/$skill/SKILL.md; done || true",
 			"echo 'workspace seeded'",
 		}, " && ")},
 		VolumeMounts: []corev1.VolumeMount{
