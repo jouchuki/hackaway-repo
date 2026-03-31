@@ -1176,7 +1176,11 @@ func (r *ClawAgentReconciler) buildOpenclawConfig(agent *clawv1.ClawAgent, ns, n
 	}
 
 	// --- A2A gateway plugin configuration ---
-	pluginAllow := []string{}
+	// Build plugins.allow — must include ALL active plugins or OpenClaw blocks them.
+	pluginAllow := []string{"observeclaw"}
+	for _, ch := range channels {
+		pluginAllow = append(pluginAllow, ch.Spec.Type)
+	}
 	if agent.Spec.A2A.Enabled {
 		a2aPort := agent.Spec.A2A.ResolvedPort()
 		cardName := agent.Spec.A2A.AgentCardName
@@ -1255,10 +1259,10 @@ func (r *ClawAgentReconciler) buildOpenclawConfig(agent *clawv1.ClawAgent, ns, n
 	pluginsCfg := map[string]any{
 		"enabled": true,
 		"entries": pluginEntries,
+		"allow":   pluginAllow,
 	}
-	if len(pluginAllow) > 0 {
-		pluginsCfg["allow"] = pluginAllow
-		// Tell OpenClaw where to find the a2a-gateway plugin.
+	// Tell OpenClaw where to find the a2a-gateway plugin if A2A is enabled.
+	if agent.Spec.A2A.Enabled {
 		pluginsCfg["load"] = map[string]any{
 			"paths": []string{"/home/node/.openclaw/workspace/plugins/a2a-gateway"},
 		}
