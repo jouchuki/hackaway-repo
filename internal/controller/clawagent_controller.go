@@ -379,6 +379,259 @@ func (r *ClawAgentReconciler) ensurePVC(ctx context.Context, owner *clawv1.ClawA
 		}
 	}
 
+	// Check if PVC needs resizing.
+	requestedSize := resource.MustParse(storageSize)
+	existingSize := existing.Spec.Resources.Requests[corev1.ResourceStorage]
+	if requestedSize.Cmp(existingSize) > 0 {
+		return r.resizePVC(ctx, owner, existing, ns, name, pvcName, requestedSize, reclaimPolicy)
+	} else if requestedSize.Cmp(existingSize) < 0 {
+		log.Info("WARNING: requested storage size is smaller than existing PVC — cannot shrink",
+			"pvc", pvcName, "existing", existingSize.String(), "requested", requestedSize.String())
+	}
+
+	return nil
+}
+
+// resizePVC handles PVC expansion by creating a temp PVC, migrating data, and swapping.
+// Steps: create temp PVC → run migration pod → delete old PVC → create new PVC → run reverse migration → delete temp.
+// The reconciler is reentrant: each call picks up where the last one left off.
+func (r *ClawAgentReconciler) resizePVC(ctx context.Context, owner *clawv1.ClawAgent, oldPVC *corev1.PersistentVolumeClaim, ns, name, pvcName string, newSize resource.Quantity, reclaimPolicy string) error {
+	log := logf.FromContext(ctx)
+	tmpPVCName := pvcName + "-resize"
+	migratePodName := name + "-pvc-migrate"
+
+	// Step 1: Ensure temp PVC exists with the new size.
+	tmpPVC := &corev1.PersistentVolumeClaim{}
+	tmpKey := types.NamespacedName{Name: tmpPVCName, Namespace: ns}
+	if err := r.Get(ctx, tmpKey, tmpPVC); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		// Create temp PVC.
+		tmpPVC = &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      tmpPVCName,
+				Namespace: ns,
+				Labels:    agentLabels(name),
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: newSize,
+					},
+				},
+			},
+		}
+		if owner.Spec.Workspace.StorageClassName != nil {
+			tmpPVC.Spec.StorageClassName = owner.Spec.Workspace.StorageClassName
+		}
+		log.Info("creating temp PVC for resize migration", "pvc", tmpPVCName, "size", newSize.String())
+		return r.Create(ctx, tmpPVC)
+	}
+
+	// Step 2: Ensure migration pod exists and run copy old → temp.
+	migratePod := &corev1.Pod{}
+	migrateKey := types.NamespacedName{Name: migratePodName, Namespace: ns}
+	if err := r.Get(ctx, migrateKey, migratePod); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		// Create migration pod.
+		migratePod = &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      migratePodName,
+				Namespace: ns,
+				Labels:    agentLabels(name),
+			},
+			Spec: corev1.PodSpec{
+				RestartPolicy: corev1.RestartPolicyNever,
+				SecurityContext: &corev1.PodSecurityContext{
+					RunAsUser:  int64Ptr(1000),
+					RunAsGroup: int64Ptr(1000),
+					FSGroup:    int64Ptr(1000),
+				},
+				Containers: []corev1.Container{
+					{
+						Name:    "migrate",
+						Image:   "busybox:1.36",
+						Command: []string{"sh", "-c", "cp -a /src/. /dst/ && echo 'migration complete'"},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "src", MountPath: "/src", ReadOnly: true},
+							{Name: "dst", MountPath: "/dst"},
+						},
+					},
+				},
+				Volumes: []corev1.Volume{
+					{
+						Name: "src",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: pvcName,
+								ReadOnly:  true,
+							},
+						},
+					},
+					{
+						Name: "dst",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: tmpPVCName,
+							},
+						},
+					},
+				},
+			},
+		}
+		log.Info("creating migration pod to copy data to resized PVC", "pod", migratePodName)
+		return r.Create(ctx, migratePod)
+	}
+
+	// Step 3: Check if migration pod completed.
+	if migratePod.Status.Phase == corev1.PodSucceeded {
+		log.Info("migration pod completed, swapping PVCs", "pod", migratePodName)
+
+		// Delete migration pod.
+		if err := r.Delete(ctx, migratePod); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+
+		// Delete old PVC.
+		if err := r.Delete(ctx, oldPVC); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+
+		// Rename temp PVC → final name. Can't rename in K8s, so we create a
+		// new PVC with the original name and do a second migration.
+		// But first check if old PVC is actually gone yet.
+		checkOld := &corev1.PersistentVolumeClaim{}
+		if err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: ns}, checkOld); err == nil {
+			// Still exists (finalizers?), requeue.
+			log.Info("waiting for old PVC deletion to complete", "pvc", pvcName)
+			return nil
+		}
+
+		// Create final PVC with original name and new size.
+		finalPVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      pvcName,
+				Namespace: ns,
+				Labels:    agentLabels(name),
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: newSize,
+					},
+				},
+			},
+		}
+		if owner.Spec.Workspace.StorageClassName != nil {
+			finalPVC.Spec.StorageClassName = owner.Spec.Workspace.StorageClassName
+		}
+		if reclaimPolicy == "delete" {
+			if err := ctrl.SetControllerReference(owner, finalPVC, r.Scheme); err != nil {
+				return fmt.Errorf("setting owner reference on resized PVC: %w", err)
+			}
+		}
+		log.Info("creating new PVC with resized capacity", "pvc", pvcName, "size", newSize.String())
+		if err := r.Create(ctx, finalPVC); err != nil {
+			return err
+		}
+
+		// Create a reverse migration pod: temp → final.
+		reversePodName := name + "-pvc-migrate-back"
+		reversePod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      reversePodName,
+				Namespace: ns,
+				Labels:    agentLabels(name),
+			},
+			Spec: corev1.PodSpec{
+				RestartPolicy: corev1.RestartPolicyNever,
+				SecurityContext: &corev1.PodSecurityContext{
+					RunAsUser:  int64Ptr(1000),
+					RunAsGroup: int64Ptr(1000),
+					FSGroup:    int64Ptr(1000),
+				},
+				Containers: []corev1.Container{
+					{
+						Name:    "migrate",
+						Image:   "busybox:1.36",
+						Command: []string{"sh", "-c", "cp -a /src/. /dst/ && echo 'reverse migration complete'"},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "src", MountPath: "/src", ReadOnly: true},
+							{Name: "dst", MountPath: "/dst"},
+						},
+					},
+				},
+				Volumes: []corev1.Volume{
+					{
+						Name: "src",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: tmpPVCName,
+								ReadOnly:  true,
+							},
+						},
+					},
+					{
+						Name: "dst",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: pvcName,
+							},
+						},
+					},
+				},
+			},
+		}
+		log.Info("creating reverse migration pod", "pod", reversePodName)
+		return r.Create(ctx, reversePod)
+	}
+
+	if migratePod.Status.Phase == corev1.PodFailed {
+		log.Error(fmt.Errorf("migration pod failed"), "PVC resize migration failed", "pod", migratePodName)
+		// Clean up failed pod so next reconcile can retry.
+		_ = r.Delete(ctx, migratePod)
+		return fmt.Errorf("PVC resize migration failed — check pod %s logs", migratePodName)
+	}
+
+	// Step 4: Check for reverse migration pod completion.
+	reversePodName := name + "-pvc-migrate-back"
+	reversePod := &corev1.Pod{}
+	reverseKey := types.NamespacedName{Name: reversePodName, Namespace: ns}
+	if err := r.Get(ctx, reverseKey, reversePod); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Reverse pod not created yet — probably waiting for next reconcile.
+			return nil
+		}
+		return err
+	}
+
+	if reversePod.Status.Phase == corev1.PodSucceeded {
+		log.Info("PVC resize complete — cleaning up temp resources")
+		// Delete reverse migration pod.
+		if err := r.Delete(ctx, reversePod); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+		// Delete temp PVC.
+		if err := r.Delete(ctx, tmpPVC); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+		log.Info("PVC resize migration finished successfully", "pvc", pvcName, "newSize", newSize.String())
+		return nil
+	}
+
+	if reversePod.Status.Phase == corev1.PodFailed {
+		log.Error(fmt.Errorf("reverse migration pod failed"), "PVC resize reverse migration failed", "pod", reversePodName)
+		_ = r.Delete(ctx, reversePod)
+		return fmt.Errorf("PVC resize reverse migration failed — check pod %s logs", reversePodName)
+	}
+
+	// Migration still in progress — next reconcile will check again.
+	log.Info("PVC resize migration in progress", "pvc", pvcName)
 	return nil
 }
 
