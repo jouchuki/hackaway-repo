@@ -1,0 +1,16 @@
+apiVersion: claw.clawbernetes.io/v1
+kind: ClawChannel
+metadata:
+  name: eng-slack
+  namespace: clawbernetes
+  labels:
+    team: engineering
+spec:
+  type: slack
+  credentialsSecret: slack-creds
+  config:
+    mode: "socket"
+    webhookPath: "/slack/events"
+    streaming: "partial"
+    nativeStreaming: "true"
+    groupPolicy: "allowlist"

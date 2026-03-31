@@ -19,8 +19,8 @@ spec:
       I am eng-agent, the infrastructure specialist for this cluster.
   skillSet: engineering-skills
   policy: engineering-policy
-  connectors:
-    - production-postgres
+  channels:
+    - eng-telegram
   gateway: main-gateway
   observability: fleet-observability
   telemetryCapture:

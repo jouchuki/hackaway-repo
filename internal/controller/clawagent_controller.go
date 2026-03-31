@@ -246,7 +246,7 @@ func (r *ClawAgentReconciler) updateFleetDashboard(ctx context.Context, ns strin
 			Policy:        a.Spec.Policy,
 			SkillSet:      a.Spec.SkillSet,
 			Observability: a.Spec.Observability,
-			Connectors:    a.Spec.Connectors,
+			Channels:      a.Spec.Channels,
 			RestartPolicy: a.Spec.Lifecycle.RestartPolicy,
 			MaxRuntime:    a.Spec.Lifecycle.MaxRuntime,
 			IdleHibernate: hibernate,
