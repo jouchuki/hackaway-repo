@@ -132,6 +132,16 @@ type WorkspaceSpec struct {
 	// storageClassName overrides the default StorageClass for the PVC.
 	// +optional
 	StorageClassName *string `json:"storageClassName,omitempty"`
+
+	// reclaimPolicy controls whether the PVC is deleted or retained when the
+	// ClawAgent CR is removed. Only meaningful when mode=persistent.
+	// "retain" (default for persistent): PVC survives agent deletion, allowing
+	// state recovery by recreating the agent with the same name.
+	// "delete": PVC is garbage-collected with the agent CR.
+	// +optional
+	// +kubebuilder:default=retain
+	// +kubebuilder:validation:Enum=retain;delete
+	ReclaimPolicy string `json:"reclaimPolicy,omitempty"`
 }
 
 // ClawAgentSpec defines the desired state of ClawAgent.

@@ -194,6 +194,18 @@ spec:
                     - ephemeral
                     - persistent
                     type: string
+                  reclaimPolicy:
+                    default: retain
+                    description: |-
+                      reclaimPolicy controls whether the PVC is deleted or retained when the
+                      ClawAgent CR is removed. Only meaningful when mode=persistent.
+                      "retain" (default for persistent): PVC survives agent deletion, allowing
+                      state recovery by recreating the agent with the same name.
+                      "delete": PVC is garbage-collected with the agent CR.
+                    enum:
+                    - retain
+                    - delete
+                    type: string
                   storageClassName:
                     description: storageClassName overrides the default StorageClass
                       for the PVC.
