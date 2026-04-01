@@ -18,12 +18,15 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -49,7 +52,9 @@ var errRequeueNeeded = errors.New("requeue needed")
 // ClawAgentReconciler reconciles a ClawAgent object
 type ClawAgentReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme            *runtime.Scheme
+	lastDashboardHash string
+	dashboardMu       sync.Mutex
 }
 
 // +kubebuilder:rbac:groups=claw.clawbernetes.io,resources=clawagents,verbs=get;list;watch;create;update;patch;delete
@@ -299,6 +304,15 @@ func (r *ClawAgentReconciler) updateFleetDashboard(ctx context.Context, ns strin
 
 	html := generateFleetDashboardHTML(infos)
 
+	// Skip the ConfigMap write if the dashboard content hasn't changed.
+	sum := sha256.Sum256([]byte(html))
+	hash := hex.EncodeToString(sum[:])
+	r.dashboardMu.Lock()
+	defer r.dashboardMu.Unlock()
+	if hash == r.lastDashboardHash {
+		return nil
+	}
+
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "fleet-dashboard",
@@ -314,12 +328,17 @@ func (r *ClawAgentReconciler) updateFleetDashboard(ctx context.Context, ns strin
 	existing := &corev1.ConfigMap{}
 	if err := r.Get(ctx, key, existing); err != nil {
 		if apierrors.IsNotFound(err) {
+			r.lastDashboardHash = hash
 			return r.Create(ctx, cm)
 		}
 		return err
 	}
 	existing.Data = cm.Data
-	return r.Update(ctx, existing)
+	if err := r.Update(ctx, existing); err != nil {
+		return err
+	}
+	r.lastDashboardHash = hash
+	return nil
 }
 
 // ---------------------------------------------------------------------------
