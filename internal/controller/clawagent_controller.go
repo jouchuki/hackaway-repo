@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -334,6 +335,35 @@ func (r *ClawAgentReconciler) ensureResource(ctx context.Context, owner *clawv1.
 		}
 		return err
 	}
+
+	// Update existing resource if spec has drifted.
+	switch desired := obj.(type) {
+	case *corev1.ConfigMap:
+		old := existing.(*corev1.ConfigMap)
+		if !reflect.DeepEqual(old.Data, desired.Data) || !reflect.DeepEqual(old.BinaryData, desired.BinaryData) {
+			old.Data = desired.Data
+			old.BinaryData = desired.BinaryData
+			log.Info("updating resource", "kind", desc, "name", key.Name)
+			return r.Update(ctx, old)
+		}
+	case *appsv1.Deployment:
+		old := existing.(*appsv1.Deployment)
+		if !reflect.DeepEqual(old.Spec, desired.Spec) {
+			old.Spec = desired.Spec
+			log.Info("updating resource", "kind", desc, "name", key.Name)
+			return r.Update(ctx, old)
+		}
+	case *corev1.Service:
+		old := existing.(*corev1.Service)
+		if !reflect.DeepEqual(old.Spec.Ports, desired.Spec.Ports) || !reflect.DeepEqual(old.Spec.Selector, desired.Spec.Selector) {
+			// Preserve ClusterIP — it is immutable and assigned by the API server.
+			desired.Spec.ClusterIP = old.Spec.ClusterIP
+			old.Spec = desired.Spec
+			log.Info("updating resource", "kind", desc, "name", key.Name)
+			return r.Update(ctx, old)
+		}
+	}
+
 	return nil
 }
 
