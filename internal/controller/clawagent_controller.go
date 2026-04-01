@@ -39,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	clawv1 "github.com/clawbernetes/operator/api/v1"
@@ -1596,6 +1597,7 @@ func (r *ClawAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
+		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 5}).
 		Named("clawagent").
 		Complete(r)
 }
