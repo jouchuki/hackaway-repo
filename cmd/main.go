@@ -38,6 +38,8 @@ import (
 	clawv1 "github.com/clawbernetes/operator/api/v1"
 	"net/http"
 
+	"k8s.io/client-go/kubernetes"
+
 	"github.com/clawbernetes/operator/internal/api"
 	"github.com/clawbernetes/operator/internal/controller"
 	// +kubebuilder:scaffold:imports
@@ -219,6 +221,10 @@ func main() {
 		Client:    mgr.GetClient(),
 		Namespace: "clawbernetes",
 		Port:      9090,
+	}
+	// Try to create clientset for pod log access.
+	if cs, err := kubernetes.NewForConfig(mgr.GetConfig()); err == nil {
+		apiServer.Clientset = cs
 	}
 	go func() {
 		if err := apiServer.Start(signalCtx); err != nil && err != http.ErrServerClosed {

@@ -217,6 +217,43 @@ header h1 {
 .channel-name { flex: 1; font-size: 13px; }
 .channel-type { font-size: 11px; color: #666; text-transform: uppercase; }
 
+/* Activity Feed */
+.activity-section {
+  background: #1a1a2e;
+  border: 1px solid #2a2a3a;
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.activity-list {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.activity-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0;
+  border-bottom: 1px solid #1f1f30;
+  font-size: 11px;
+  flex-wrap: wrap;
+}
+
+.activity-item:last-child { border-bottom: none; }
+
+.activity-time { color: #555; min-width: 70px; }
+.activity-agent { font-size: 10px; }
+.activity-type { color: #888; }
+.activity-status { color: #4ecca3; }
+.activity-dur { color: #666; }
+.activity-msg { color: #aaa; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.activity-item.alert .activity-msg { color: #ffd369; }
+
+.tag.alert { background: #2e2a1a; color: #ffd369; }
+
 @media (max-width: 900px) {
   .main-grid { grid-template-columns: 1fr; }
 }

@@ -190,10 +190,47 @@ function A2AMesh({ agents }: { agents: Agent[] }) {
   )
 }
 
+interface ActivityEvent {
+  ts: string
+  agent: string
+  type: string
+  taskId?: string
+  status?: string
+  durationMs?: number
+  message?: string
+}
+
+function ActivityFeed({ events }: { events: ActivityEvent[] }) {
+  if (events.length === 0) return null
+
+  return (
+    <div className="activity-section">
+      <h3>Latest Activity</h3>
+      <div className="activity-list">
+        {events.slice(0, 20).map((e, i) => (
+          <div key={i} className={`activity-item ${e.type}`}>
+            <span className="activity-time">
+              {e.ts ? new Date(e.ts).toLocaleTimeString() : ''}
+            </span>
+            <span className={`activity-agent tag ${e.type === 'alert' ? 'alert' : 'a2a'}`}>
+              {e.agent}
+            </span>
+            <span className="activity-type">{e.type}</span>
+            {e.status && <span className="activity-status">{e.status}</span>}
+            {e.durationMs ? <span className="activity-dur">{e.durationMs}ms</span> : null}
+            {e.message && <span className="activity-msg">{e.message}</span>}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function App() {
   const [agents, setAgents] = useState<Agent[]>([])
   const [channels, setChannels] = useState<Channel[]>([])
   const [summary, setSummary] = useState<Summary | null>(null)
+  const [activity, setActivity] = useState<ActivityEvent[]>([])
   const [error, setError] = useState<string | null>(null)
 
   const fetchAll = () => {
@@ -201,11 +238,13 @@ function App() {
       fetch(`${API}/api/agents`).then(r => r.json()),
       fetch(`${API}/api/channels`).then(r => r.json()),
       fetch(`${API}/api/summary`).then(r => r.json()),
+      fetch(`${API}/api/activity`).then(r => r.json()).catch(() => []),
     ])
-      .then(([a, c, s]) => {
+      .then(([a, c, s, act]) => {
         setAgents(a || [])
         setChannels(c || [])
         setSummary(s)
+        setActivity(act || [])
         setError(null)
       })
       .catch(e => setError(e.message))
@@ -245,6 +284,8 @@ function App() {
 
         <div className="sidebar">
           <A2AMesh agents={agents} />
+
+          <ActivityFeed events={activity} />
 
           <div className="channels-section">
             <h3>Channels</h3>
