@@ -214,19 +214,20 @@ func main() {
 	}
 
 	// Start control plane API server in background.
+	signalCtx := ctrl.SetupSignalHandler()
 	apiServer := &api.Server{
 		Client:    mgr.GetClient(),
 		Namespace: "clawbernetes",
 		Port:      9090,
 	}
 	go func() {
-		if err := apiServer.Start(ctrl.SetupSignalHandler()); err != nil && err != http.ErrServerClosed {
+		if err := apiServer.Start(signalCtx); err != nil && err != http.ErrServerClosed {
 			setupLog.Error(err, "Control plane API server failed")
 		}
 	}()
 
 	setupLog.Info("Starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(signalCtx); err != nil {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}
