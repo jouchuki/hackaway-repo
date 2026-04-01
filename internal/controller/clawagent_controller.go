@@ -80,6 +80,11 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	ns := agent.Namespace
 	name := agent.Name
 
+	// Capture current status so we can skip the write if nothing changed.
+	oldPhase := agent.Status.Phase
+	oldPodName := agent.Status.PodName
+	oldPVC := agent.Status.WorkspacePVC
+
 	// --- Resolve the OTLP endpoint from the referenced ClawObservability ---
 	otlpEndpoint := ""
 	if agent.Spec.Observability != "" {
@@ -215,14 +220,16 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	// --- Status ---
+	// --- Status (skip write if unchanged) ---
 	phase, podName := r.resolveAgentStatus(ctx, ns, name)
 	agent.Status.Phase = phase
 	agent.Status.PodName = podName
 	agent.Status.WorkspacePVC = activePVC
-	if err := r.Status().Update(ctx, agent); err != nil {
-		log.Error(err, "unable to update ClawAgent status")
-		return ctrl.Result{}, err
+	if phase != oldPhase || podName != oldPodName || activePVC != oldPVC {
+		if err := r.Status().Update(ctx, agent); err != nil {
+			log.Error(err, "unable to update ClawAgent status")
+			return ctrl.Result{}, err
+		}
 	}
 
 	log.Info("reconciled ClawAgent", "name", name, "phase", phase)
