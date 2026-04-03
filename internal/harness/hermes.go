@@ -25,7 +25,7 @@ import (
 type HermesHarness struct{}
 
 func (h *HermesHarness) Name() string            { return "hermes" }
-func (h *HermesHarness) DefaultImage() string    { return "clawbernetes/hermes:latest" }
+func (h *HermesHarness) DefaultImage() string    { return "nousresearch/hermes-agent:latest" }
 func (h *HermesHarness) GatewayPort() int32      { return 8080 }
 func (h *HermesHarness) HomePath() string        { return "/home/hermes/.hermes" }
 func (h *HermesHarness) WorkspacePath() string   { return "/home/hermes/.hermes/workspace" }

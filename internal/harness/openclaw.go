@@ -29,7 +29,7 @@ import (
 type OpenClawHarness struct{}
 
 func (h *OpenClawHarness) Name() string            { return "openclaw" }
-func (h *OpenClawHarness) DefaultImage() string    { return "clawbernetes/openclaw:latest" }
+func (h *OpenClawHarness) DefaultImage() string    { return "ghcr.io/openclaw/openclaw:latest" }
 func (h *OpenClawHarness) GatewayPort() int32      { return 18789 }
 func (h *OpenClawHarness) HomePath() string        { return "/home/node/.openclaw" }
 func (h *OpenClawHarness) WorkspacePath() string   { return "/home/node/.openclaw/workspace" }

@@ -1,0 +1,319 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package harness
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	clawv1 "github.com/clawbernetes/operator/api/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// TestForType verifies the registry returns the correct harness for each type.
+func TestForType(t *testing.T) {
+	tests := []struct {
+		htype    clawv1.HarnessType
+		wantName string
+	}{
+		{clawv1.HarnessOpenClaw, "openclaw"},
+		{clawv1.HarnessHermes, "hermes"},
+		{clawv1.HarnessIronClaw, "ironclaw"},
+		{"", "openclaw"},        // empty defaults to openclaw
+		{"unknown", "openclaw"}, // unknown defaults to openclaw
+	}
+	for _, tt := range tests {
+		h := ForType(tt.htype)
+		if h.Name() != tt.wantName {
+			t.Errorf("ForType(%q).Name() = %q, want %q", tt.htype, h.Name(), tt.wantName)
+		}
+	}
+}
+
+// TestHarnessProperties verifies each harness returns consistent, non-empty values.
+func TestHarnessProperties(t *testing.T) {
+	harnesses := []Harness{
+		&OpenClawHarness{},
+		&HermesHarness{},
+		&IronClawHarness{},
+	}
+
+	for _, h := range harnesses {
+		t.Run(h.Name(), func(t *testing.T) {
+			if h.DefaultImage() == "" {
+				t.Error("DefaultImage() is empty")
+			}
+			if h.GatewayPort() <= 0 {
+				t.Errorf("GatewayPort() = %d, want > 0", h.GatewayPort())
+			}
+			if h.HomePath() == "" {
+				t.Error("HomePath() is empty")
+			}
+			if !strings.HasPrefix(h.WorkspacePath(), h.HomePath()) {
+				t.Errorf("WorkspacePath() %q should be under HomePath() %q", h.WorkspacePath(), h.HomePath())
+			}
+			if !strings.HasPrefix(h.ExtensionsPath(), h.HomePath()) {
+				t.Errorf("ExtensionsPath() %q should be under HomePath() %q", h.ExtensionsPath(), h.HomePath())
+			}
+			if h.ConfigFileName() == "" {
+				t.Error("ConfigFileName() is empty")
+			}
+			if h.ConfigMapSuffix() == "" {
+				t.Error("ConfigMapSuffix() is empty")
+			}
+			if !strings.HasPrefix(h.ConfigMapSuffix(), "-") {
+				t.Errorf("ConfigMapSuffix() %q should start with '-'", h.ConfigMapSuffix())
+			}
+			if h.ReadinessPath() == "" {
+				t.Error("ReadinessPath() is empty")
+			}
+			if h.LivenessPath() == "" {
+				t.Error("LivenessPath() is empty")
+			}
+			if h.ContainerName() == "" {
+				t.Error("ContainerName() is empty")
+			}
+			if cmds := h.CopyExtensionsCommands(); len(cmds) == 0 {
+				t.Error("CopyExtensionsCommands() returned empty slice")
+			}
+			if cmds := h.SeedCommands(); len(cmds) == 0 {
+				t.Error("SeedCommands() returned empty slice")
+			}
+		})
+	}
+}
+
+// TestOpenClawDefaultImage verifies OpenClaw points to the published ghcr.io image.
+func TestOpenClawDefaultImage(t *testing.T) {
+	h := &OpenClawHarness{}
+	if got := h.DefaultImage(); got != "ghcr.io/openclaw/openclaw:latest" {
+		t.Errorf("DefaultImage() = %q, want ghcr.io/openclaw/openclaw:latest", got)
+	}
+}
+
+// TestHermesDefaultImage verifies Hermes points to the published Docker Hub image.
+func TestHermesDefaultImage(t *testing.T) {
+	h := &HermesHarness{}
+	if got := h.DefaultImage(); got != "nousresearch/hermes-agent:latest" {
+		t.Errorf("DefaultImage() = %q, want nousresearch/hermes-agent:latest", got)
+	}
+}
+
+// TestIronClawDefaultImage verifies IronClaw points to the published Docker Hub image.
+func TestIronClawDefaultImage(t *testing.T) {
+	h := &IronClawHarness{}
+	if got := h.DefaultImage(); got != "nearaidev/ironclaw:latest" {
+		t.Errorf("DefaultImage() = %q, want nearaidev/ironclaw:latest", got)
+	}
+}
+
+// TestOpenClawBuildConfig verifies the generated openclaw.json has the expected structure.
+func TestOpenClawBuildConfig(t *testing.T) {
+	h := &OpenClawHarness{}
+	input := ConfigInput{
+		Agent: &clawv1.ClawAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+			Spec: clawv1.ClawAgentSpec{
+				Model: clawv1.AgentModelSpec{
+					Provider: "anthropic",
+					Name:     "claude-sonnet-4-6",
+				},
+			},
+		},
+		Name:      "test-agent",
+		Namespace: "default",
+	}
+
+	raw, err := h.BuildConfig(input)
+	if err != nil {
+		t.Fatalf("BuildConfig() error: %v", err)
+	}
+
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("BuildConfig() produced invalid JSON: %v", err)
+	}
+
+	// Verify gateway section exists with correct port.
+	gw, ok := cfg["gateway"].(map[string]any)
+	if !ok {
+		t.Fatal("missing 'gateway' section in config")
+	}
+	if port, ok := gw["port"].(float64); !ok || int32(port) != h.GatewayPort() {
+		t.Errorf("gateway.port = %v, want %d", gw["port"], h.GatewayPort())
+	}
+
+	// Verify agents section exists with correct agent ID.
+	agents, ok := cfg["agents"].(map[string]any)
+	if !ok {
+		t.Fatal("missing 'agents' section in config")
+	}
+	list, ok := agents["list"].([]any)
+	if !ok || len(list) == 0 {
+		t.Fatal("missing 'agents.list' in config")
+	}
+	first := list[0].(map[string]any)
+	if first["id"] != "test-agent" {
+		t.Errorf("agents.list[0].id = %q, want 'test-agent'", first["id"])
+	}
+
+	// Verify model provider was registered.
+	models, ok := cfg["models"].(map[string]any)
+	if !ok {
+		t.Fatal("missing 'models' section in config")
+	}
+	providers, ok := models["providers"].(map[string]any)
+	if !ok {
+		t.Fatal("missing 'models.providers' in config")
+	}
+	if _, ok := providers["anthropic"]; !ok {
+		t.Error("expected 'anthropic' provider in models.providers")
+	}
+
+	// Verify plugins section exists.
+	if _, ok := cfg["plugins"]; !ok {
+		t.Error("missing 'plugins' section in config")
+	}
+}
+
+// TestOpenClawBuildConfigWithOTLP verifies diagnostics are injected when OTLP is set.
+func TestOpenClawBuildConfigWithOTLP(t *testing.T) {
+	h := &OpenClawHarness{}
+	input := ConfigInput{
+		Agent: &clawv1.ClawAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "otel-agent", Namespace: "default"},
+			Spec:       clawv1.ClawAgentSpec{},
+		},
+		Name:         "otel-agent",
+		Namespace:    "default",
+		OTLPEndpoint: "http://tempo.observability:4318",
+	}
+
+	raw, err := h.BuildConfig(input)
+	if err != nil {
+		t.Fatalf("BuildConfig() error: %v", err)
+	}
+
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	diag, ok := cfg["diagnostics"].(map[string]any)
+	if !ok {
+		t.Fatal("missing 'diagnostics' section when OTLPEndpoint is set")
+	}
+	otel, ok := diag["otel"].(map[string]any)
+	if !ok {
+		t.Fatal("missing 'diagnostics.otel' section")
+	}
+	if otel["endpoint"] != "http://tempo.observability:4318" {
+		t.Errorf("otel.endpoint = %q, want 'http://tempo.observability:4318'", otel["endpoint"])
+	}
+}
+
+// TestHermesBuildConfig verifies the Hermes stub config is valid JSON.
+func TestHermesBuildConfig(t *testing.T) {
+	h := &HermesHarness{}
+	input := ConfigInput{
+		Agent: &clawv1.ClawAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "hermes-test", Namespace: "default"},
+		},
+		Name:      "hermes-test",
+		Namespace: "default",
+	}
+
+	raw, err := h.BuildConfig(input)
+	if err != nil {
+		t.Fatalf("BuildConfig() error: %v", err)
+	}
+
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("Hermes BuildConfig() produced invalid JSON: %v", err)
+	}
+	if cfg["agent"] != "hermes-test" {
+		t.Errorf("agent = %q, want 'hermes-test'", cfg["agent"])
+	}
+}
+
+// TestIronClawBuildConfig verifies the IronClaw stub config is valid JSON.
+func TestIronClawBuildConfig(t *testing.T) {
+	h := &IronClawHarness{}
+	input := ConfigInput{
+		Agent: &clawv1.ClawAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "iron-test", Namespace: "default"},
+		},
+		Name:      "iron-test",
+		Namespace: "default",
+	}
+
+	raw, err := h.BuildConfig(input)
+	if err != nil {
+		t.Fatalf("BuildConfig() error: %v", err)
+	}
+
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("IronClaw BuildConfig() produced invalid JSON: %v", err)
+	}
+	if cfg["agent"] != "iron-test" {
+		t.Errorf("agent = %q, want 'iron-test'", cfg["agent"])
+	}
+}
+
+// TestCopyExtensionsCommandsContainHomePath verifies the commands reference the harness home path.
+func TestCopyExtensionsCommandsContainHomePath(t *testing.T) {
+	harnesses := []Harness{&OpenClawHarness{}, &HermesHarness{}, &IronClawHarness{}}
+	for _, h := range harnesses {
+		t.Run(h.Name(), func(t *testing.T) {
+			cmds := h.CopyExtensionsCommands()
+			joined := strings.Join(cmds, "\n")
+			if !strings.Contains(joined, h.HomePath()) {
+				t.Errorf("CopyExtensionsCommands() should reference HomePath %q", h.HomePath())
+			}
+		})
+	}
+}
+
+// TestSeedCommandsContainConfigFile verifies seed commands reference the config file name.
+func TestSeedCommandsContainConfigFile(t *testing.T) {
+	harnesses := []Harness{&OpenClawHarness{}, &HermesHarness{}, &IronClawHarness{}}
+	for _, h := range harnesses {
+		t.Run(h.Name(), func(t *testing.T) {
+			cmds := h.SeedCommands()
+			joined := strings.Join(cmds, "\n")
+			if !strings.Contains(joined, h.ConfigFileName()) {
+				t.Errorf("SeedCommands() should reference ConfigFileName %q", h.ConfigFileName())
+			}
+		})
+	}
+}
+
+// TestUniqueGatewayPorts verifies each harness uses a distinct gateway port.
+func TestUniqueGatewayPorts(t *testing.T) {
+	harnesses := []Harness{&OpenClawHarness{}, &HermesHarness{}, &IronClawHarness{}}
+	seen := map[int32]string{}
+	for _, h := range harnesses {
+		port := h.GatewayPort()
+		if prev, ok := seen[port]; ok {
+			t.Errorf("%s and %s share gateway port %d", prev, h.Name(), port)
+		}
+		seen[port] = h.Name()
+	}
+}

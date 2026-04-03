@@ -25,7 +25,7 @@ import (
 type IronClawHarness struct{}
 
 func (h *IronClawHarness) Name() string            { return "ironclaw" }
-func (h *IronClawHarness) DefaultImage() string    { return "clawbernetes/ironclaw:latest" }
+func (h *IronClawHarness) DefaultImage() string    { return "nearaidev/ironclaw:latest" }
 func (h *IronClawHarness) GatewayPort() int32      { return 9090 }
 func (h *IronClawHarness) HomePath() string        { return "/home/ironclaw/.ironclaw" }
 func (h *IronClawHarness) WorkspacePath() string   { return "/home/ironclaw/.ironclaw/workspace" }
