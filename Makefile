@@ -194,95 +194,32 @@ kind-setup: ## Create a kind cluster and install CRDs.
 kind-teardown: ## Delete the kind cluster.
 	$(KIND) delete cluster --name $(KIND_CLUSTER_NAME)
 
-.PHONY: demo
-demo: kind-setup ## Full local demo: create kind cluster, install CRDs, print next steps.
-	@echo ""
-	@echo "=== Cluster ready. CRDs installed. ==="
-	@echo "Next: make demo-up"
-	@echo ""
-
-SKIP_IMAGE ?= 0
-
-.PHONY: demo-up
-demo-up: build kind-setup create-secrets ## One command: build everything, load images, apply all CRs, run operator.
-ifeq ($(SKIP_IMAGE),0)
-	$(MAKE) build-openclaw-image load-kind
-endif
-	@# Clean up any previous operator
+.PHONY: dev
+dev: kind-setup install create-secrets ## Start local dev: kind cluster + operator + dashboard.
+	@echo "=== Starting operator... ==="
 	@fuser -k 8081/tcp 2>/dev/null || true
-	@fuser -k 8080/tcp 2>/dev/null || true
-	@sleep 1
-	@# Delete existing CRs so resources get recreated cleanly
-	@$(KUBECTL) delete clawagents --all -n clawbernetes --ignore-not-found 2>/dev/null || true
-	@$(KUBECTL) delete clawobservabilities --all -n clawbernetes --ignore-not-found 2>/dev/null || true
-	@$(KUBECTL) delete clawskillsets --all -n clawbernetes --ignore-not-found 2>/dev/null || true
-	@$(KUBECTL) delete clawpolicies --all -n clawbernetes --ignore-not-found 2>/dev/null || true
-	@$(KUBECTL) delete clawgateways --all -n clawbernetes --ignore-not-found 2>/dev/null || true
-	@$(KUBECTL) delete clawconnectors --all -n clawbernetes --ignore-not-found 2>/dev/null || true
-	@sleep 3
-	@# Start operator in background
 	go run ./cmd/main.go > /tmp/clawbernetes-operator.log 2>&1 &
-	@sleep 4
-	@echo "=== Operator running (logs: /tmp/clawbernetes-operator.log) ==="
-	@# Apply all sample CRs in dependency order
-	$(KUBECTL) apply -f config/samples/claw_v1_clawobservability.yaml
-	$(KUBECTL) apply -f config/samples/claw_v1_clawskillset.yaml
-	$(KUBECTL) apply -f config/samples/claw_v1_clawpolicy.yaml
-	$(KUBECTL) apply -f config/samples/claw_v1_clawconnector.yaml
-	$(KUBECTL) apply -f config/samples/claw_v1_clawagent.yaml
-	$(KUBECTL) apply -f config/samples/claw_v1_clawagent_sales.yaml
+	@sleep 3
+	@echo "=== Operator running (API: http://localhost:9090) ==="
+	@echo "=== Starting dashboard... ==="
+	cd ui && npm install && npm run dev &
 	@echo ""
-	@echo "=== All resources applied. Waiting for pods... ==="
-	@sleep 10
-	@$(KUBECTL) get pods -n clawbernetes
+	@echo "=== Clawbernetes Dev Environment ==="
+	@echo "  Dashboard:  http://localhost:5173"
+	@echo "  API:        http://localhost:9090"
+	@echo "  Operator:   tail -f /tmp/clawbernetes-operator.log"
 	@echo ""
-	@$(KUBECTL) get clawobservabilities -n clawbernetes
-	@$(KUBECTL) get clawagents -n clawbernetes
-	@echo ""
-	@echo ""
-	@echo "Next: make demo-proxy"
-	@echo "Watch pods:    kubectl get pods -n clawbernetes -w"
-	@echo "Operator log:  tail -f /tmp/clawbernetes-operator.log"
-	@echo "Tear down:     make demo-down"
 
-.PHONY: demo-proxy
-demo-proxy: ## Deploy agent proxy and set up *.local hostnames.
-	@$(KUBECTL) apply -f config/proxy/nginx-configmap.yaml
-	@$(KUBECTL) apply -f config/proxy/nginx-deployment.yaml
-	@echo "Waiting for proxy pod..."
-	@$(KUBECTL) wait --for=condition=available deploy/agent-proxy -n clawbernetes --timeout=30s
-	@$(eval PROXY_PORT := $(shell $(KUBECTL) get svc agent-proxy -n clawbernetes -o jsonpath='{.spec.ports[0].nodePort}'))
-	@echo ""
-	@echo "=== Agent Proxy ready ==="
-	@echo ""
-	@echo "Add to /etc/hosts (needs sudo):"
-	@echo "  echo '127.0.0.1 eng-agent.local sales-agent.local grafana.local' | sudo tee -a /etc/hosts"
-	@echo ""
-	@echo "Then run:"
-	@echo "  kubectl port-forward svc/agent-proxy 8080:80 -n clawbernetes"
-	@echo ""
-	@echo "Access:"
-	@echo "  http://eng-agent.local:8080     — Engineering Agent (OpenClaw UI)"
-	@echo "  http://sales-agent.local:8080   — Sales Agent (OpenClaw UI)"
-	@echo "  http://grafana.local:8080       — Grafana (Traces)"
-	@echo "  http://localhost:8080           — Landing page"
-	@echo ""
-	@echo "API (get token from agent logs):"
-	@echo "  curl http://eng-agent.local:8080/v1/chat/completions \\"
-	@echo "    -H 'Authorization: Bearer TOKEN' \\"
-	@echo "    -H 'Content-Type: application/json' \\"
-	@echo "    -d '{\"model\":\"openclaw/default\",\"messages\":[{\"role\":\"user\",\"content\":\"who are you?\"}]}'"
-
-.PHONY: demo-down
-demo-down: ## Stop operator, delete all CRs, optionally tear down cluster.
+.PHONY: dev-down
+dev-down: ## Stop operator and dashboard.
 	@fuser -k 8081/tcp 2>/dev/null || true
-	@fuser -k 8080/tcp 2>/dev/null || true
-	@$(KUBECTL) delete clawagents --all -n clawbernetes --ignore-not-found 2>/dev/null || true
-	@$(KUBECTL) delete clawobservabilities --all -n clawbernetes --ignore-not-found 2>/dev/null || true
-	@$(KUBECTL) delete clawskillsets --all -n clawbernetes --ignore-not-found 2>/dev/null || true
-	@$(KUBECTL) delete -f config/proxy/nginx-deployment.yaml --ignore-not-found 2>/dev/null || true
-	@$(KUBECTL) delete -f config/proxy/nginx-configmap.yaml --ignore-not-found 2>/dev/null || true
-	@echo "=== Demo stopped. Run 'make kind-teardown' to delete the cluster ==="
+	@fuser -k 5173/tcp 2>/dev/null || true
+	@fuser -k 9090/tcp 2>/dev/null || true
+	@echo "=== Dev environment stopped ==="
+
+.PHONY: dashboard
+dashboard: ## Start only the dashboard UI dev server.
+	cd ui && npm run dev
 
 ##@ Deployment
 

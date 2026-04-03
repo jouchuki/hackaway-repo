@@ -38,6 +38,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	clawv1 "github.com/clawbernetes/operator/api/v1"
+	"github.com/clawbernetes/operator/internal/harness"
 )
 
 const openclawImage = "clawbernetes/openclaw:latest"
@@ -78,6 +79,9 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	ns := agent.Namespace
 	name := agent.Name
+
+	// Resolve harness — hardcoded to OpenClaw until the CRD gains a harness field.
+	h := harness.ForName("openclaw")
 
 	// --- Resolve the OTLP endpoint from the referenced ClawObservability ---
 	otlpEndpoint := ""
@@ -203,13 +207,14 @@ func (r *ClawAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		GatewayURL:   gatewayURL,
 		ActivePVC:    activePVC,
 		Channels:     channels,
+		Harness:      h,
 	})
 	if err := r.ensureResource(ctx, agent, dep, "agent-deployment"); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// --- Agent Service ---
-	svc := r.agentService(agent, ns, name)
+	svc := r.agentService(agent, ns, name, h)
 	if err := r.ensureResource(ctx, agent, svc, "agent-service"); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -648,6 +653,7 @@ type deploymentParams struct {
 	GatewayURL   string
 	ActivePVC    string
 	Channels     []clawv1.ClawChannel
+	Harness      harness.Harness
 }
 
 func (r *ClawAgentReconciler) agentDeployment(p deploymentParams) *appsv1.Deployment {
@@ -828,8 +834,8 @@ func (r *ClawAgentReconciler) agentDeployment(p deploymentParams) *appsv1.Deploy
 		injectSecret(ch.Spec.CredentialsSecret)
 	}
 
-	// A2A gateway credentials.
-	if agent.Spec.A2A.Enabled {
+	// A2A gateway credentials (only for harnesses that support A2A).
+	if agent.Spec.A2A.Enabled && p.Harness.SupportsA2A() {
 		// Add A2A port to the container.
 		a2aPort := agent.Spec.A2A.ResolvedPort()
 		mainContainer.Ports = append(mainContainer.Ports, corev1.ContainerPort{
@@ -956,12 +962,12 @@ func int64Ptr(i int64) *int64 {
 // Agent Service
 // ---------------------------------------------------------------------------
 
-func (r *ClawAgentReconciler) agentService(agent *clawv1.ClawAgent, ns, name string) *corev1.Service {
+func (r *ClawAgentReconciler) agentService(agent *clawv1.ClawAgent, ns, name string, h harness.Harness) *corev1.Service {
 	labels := agentLabels(name)
 	ports := []corev1.ServicePort{
 		{Name: "gateway", Port: int32(openclawGatewayPort), TargetPort: intstr.FromInt(openclawGatewayPort), Protocol: corev1.ProtocolTCP},
 	}
-	if agent.Spec.A2A.Enabled {
+	if agent.Spec.A2A.Enabled && h.SupportsA2A() {
 		a2aPort := agent.Spec.A2A.ResolvedPort()
 		ports = append(ports, corev1.ServicePort{
 			Name: "a2a", Port: int32(a2aPort), TargetPort: intstr.FromInt(a2aPort), Protocol: corev1.ProtocolTCP,
