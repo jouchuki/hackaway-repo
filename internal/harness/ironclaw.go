@@ -30,14 +30,14 @@ type IronClawHarness struct{}
 
 func (h *IronClawHarness) Name() string               { return "ironclaw" }
 func (h *IronClawHarness) DefaultImage() string       { return "nearaidev/ironclaw:latest" }
-func (h *IronClawHarness) GatewayPort() int32         { return 3000 }
+func (h *IronClawHarness) GatewayPort() int32         { return 8080 }
 func (h *IronClawHarness) HomePath() string           { return "/root/.ironclaw" }
 func (h *IronClawHarness) WorkspacePath() string      { return "/root/.ironclaw" }
 func (h *IronClawHarness) ExtensionsPath() string     { return "/root/.ironclaw/channels" }
 func (h *IronClawHarness) ConfigFileName() string     { return ".env" }
 func (h *IronClawHarness) ConfigMapSuffix() string    { return "-ironclaw-config" }
-func (h *IronClawHarness) ReadinessPath() string      { return "/" }
-func (h *IronClawHarness) LivenessPath() string       { return "/" }
+func (h *IronClawHarness) ReadinessPath() string      { return "" }
+func (h *IronClawHarness) LivenessPath() string       { return "" }
 func (h *IronClawHarness) ContainerName() string      { return "ironclaw" }
 func (h *IronClawHarness) ContainerCommand() []string { return nil }
 func (h *IronClawHarness) RunAsUser() *int64          { return nil }
@@ -88,10 +88,10 @@ func (h *IronClawHarness) BuildConfig(input ConfigInput) (string, error) {
 	}
 	b.WriteString("\n")
 
-	// Network
+	// Network — HTTP API on 8080 (0.0.0.0), web UI on 3000 (localhost only)
 	b.WriteString("HTTP_HOST=0.0.0.0\n")
-	b.WriteString("HTTP_PORT=8080\n")
-	b.WriteString(fmt.Sprintf("WEB_GATEWAY_PORT=%d\n", h.GatewayPort()))
+	b.WriteString(fmt.Sprintf("HTTP_PORT=%d\n", h.GatewayPort()))
+	b.WriteString("WEB_GATEWAY_PORT=3000\n")
 	b.WriteString("\n")
 
 	// Agent settings

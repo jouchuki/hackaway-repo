@@ -128,8 +128,8 @@ func TestIronClawDefaultImage(t *testing.T) {
 	if got := h.DefaultImage(); got != "nearaidev/ironclaw:latest" {
 		t.Errorf("DefaultImage() = %q, want nearaidev/ironclaw:latest", got)
 	}
-	if got := h.GatewayPort(); got != 3000 {
-		t.Errorf("GatewayPort() = %d, want 3000", got)
+	if got := h.GatewayPort(); got != 8080 {
+		t.Errorf("GatewayPort() = %d, want 8080", got)
 	}
 	if got := h.HomePath(); got != "/root/.ironclaw" {
 		t.Errorf("HomePath() = %q, want /root/.ironclaw", got)
