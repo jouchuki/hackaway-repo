@@ -23,8 +23,6 @@ func ForType(t clawv1.HarnessType) Harness {
 	switch t {
 	case clawv1.HarnessHermes:
 		return &HermesHarness{}
-	case clawv1.HarnessIronClaw:
-		return &IronClawHarness{}
 	default:
 		return &OpenClawHarness{}
 	}

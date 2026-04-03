@@ -187,13 +187,12 @@ func (w WorkspaceSpec) ResolvedStorageSize() string {
 }
 
 // HarnessType is the type of agent harness runtime.
-// +kubebuilder:validation:Enum=openclaw;hermes;ironclaw
+// +kubebuilder:validation:Enum=openclaw;hermes
 type HarnessType string
 
 const (
 	HarnessOpenClaw HarnessType = "openclaw"
 	HarnessHermes   HarnessType = "hermes"
-	HarnessIronClaw HarnessType = "ironclaw"
 )
 
 // HarnessSpec selects and configures the agent harness runtime.
@@ -210,7 +209,7 @@ type HarnessSpec struct {
 
 // ClawAgentSpec defines the desired state of ClawAgent.
 type ClawAgentSpec struct {
-	// harness selects the agent harness runtime (openclaw, hermes, ironclaw).
+	// harness selects the agent harness runtime (openclaw, hermes).
 	// +optional
 	Harness HarnessSpec `json:"harness,omitempty"`
 

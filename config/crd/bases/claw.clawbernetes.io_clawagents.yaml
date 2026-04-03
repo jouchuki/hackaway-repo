@@ -127,7 +127,7 @@ spec:
                 type: string
               harness:
                 description: harness selects the agent harness runtime (openclaw,
-                  hermes, ironclaw).
+                  hermes).
                 properties:
                   image:
                     description: image overrides the default container image for this
@@ -139,7 +139,6 @@ spec:
                     enum:
                     - openclaw
                     - hermes
-                    - ironclaw
                     type: string
                 type: object
               identity:

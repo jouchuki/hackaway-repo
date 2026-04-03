@@ -33,7 +33,6 @@ func TestForType(t *testing.T) {
 	}{
 		{clawv1.HarnessOpenClaw, "openclaw"},
 		{clawv1.HarnessHermes, "hermes"},
-		{clawv1.HarnessIronClaw, "ironclaw"},
 		{"", "openclaw"},        // empty defaults to openclaw
 		{"unknown", "openclaw"}, // unknown defaults to openclaw
 	}
@@ -50,7 +49,6 @@ func TestHarnessProperties(t *testing.T) {
 	harnesses := []Harness{
 		&OpenClawHarness{},
 		&HermesHarness{},
-		&IronClawHarness{},
 	}
 
 	for _, h := range harnesses {
@@ -119,23 +117,6 @@ func TestHermesDefaultImage(t *testing.T) {
 	}
 	if got := h.ConfigFileName(); got != "config.yaml" {
 		t.Errorf("ConfigFileName() = %q, want config.yaml", got)
-	}
-}
-
-// TestIronClawDefaultImage verifies IronClaw points to the published Docker Hub image.
-func TestIronClawDefaultImage(t *testing.T) {
-	h := &IronClawHarness{}
-	if got := h.DefaultImage(); got != "nearaidev/ironclaw:latest" {
-		t.Errorf("DefaultImage() = %q, want nearaidev/ironclaw:latest", got)
-	}
-	if got := h.GatewayPort(); got != 8080 {
-		t.Errorf("GatewayPort() = %d, want 8080", got)
-	}
-	if got := h.HomePath(); got != "/root/.ironclaw" {
-		t.Errorf("HomePath() = %q, want /root/.ironclaw", got)
-	}
-	if got := h.ConfigFileName(); got != ".env" {
-		t.Errorf("ConfigFileName() = %q, want .env", got)
 	}
 }
 
@@ -284,46 +265,9 @@ func TestHermesBuildConfig(t *testing.T) {
 	}
 }
 
-// TestIronClawBuildConfig verifies the IronClaw .env has the expected structure.
-func TestIronClawBuildConfig(t *testing.T) {
-	h := &IronClawHarness{}
-	input := ConfigInput{
-		Agent: &clawv1.ClawAgent{
-			ObjectMeta: metav1.ObjectMeta{Name: "iron-test", Namespace: "default"},
-			Spec: clawv1.ClawAgentSpec{
-				Model: clawv1.AgentModelSpec{
-					Provider: "anthropic",
-					Name:     "claude-sonnet-4-6",
-				},
-			},
-		},
-		Name:      "iron-test",
-		Namespace: "default",
-	}
-
-	raw, err := h.BuildConfig(input)
-	if err != nil {
-		t.Fatalf("BuildConfig() error: %v", err)
-	}
-
-	// Verify .env format contains expected keys
-	if !strings.Contains(raw, "LLM_BACKEND=anthropic") {
-		t.Error("missing 'LLM_BACKEND=anthropic' in IronClaw config")
-	}
-	if !strings.Contains(raw, "WEB_GATEWAY_PORT=3000") {
-		t.Error("missing 'WEB_GATEWAY_PORT=3000' in IronClaw config")
-	}
-	if !strings.Contains(raw, "INJECTION_CHECK_ENABLED=true") {
-		t.Error("missing safety setting in IronClaw config")
-	}
-	if !strings.Contains(raw, "DOCKER_POLICY=workspace_write") {
-		t.Error("missing Docker sandbox policy in IronClaw config")
-	}
-}
-
 // TestCopyExtensionsCommandsNotEmpty verifies each harness has copy-extensions commands.
 func TestCopyExtensionsCommandsNotEmpty(t *testing.T) {
-	harnesses := []Harness{&OpenClawHarness{}, &HermesHarness{}, &IronClawHarness{}}
+	harnesses := []Harness{&OpenClawHarness{}, &HermesHarness{}}
 	for _, h := range harnesses {
 		t.Run(h.Name(), func(t *testing.T) {
 			cmds := h.CopyExtensionsCommands()
@@ -345,7 +289,7 @@ func TestOpenClawCopyExtensionsReferencesHome(t *testing.T) {
 
 // TestSeedCommandsContainConfigFile verifies seed commands reference the config file name.
 func TestSeedCommandsContainConfigFile(t *testing.T) {
-	harnesses := []Harness{&OpenClawHarness{}, &HermesHarness{}, &IronClawHarness{}}
+	harnesses := []Harness{&OpenClawHarness{}, &HermesHarness{}}
 	for _, h := range harnesses {
 		t.Run(h.Name(), func(t *testing.T) {
 			cmds := h.SeedCommands()
@@ -359,7 +303,7 @@ func TestSeedCommandsContainConfigFile(t *testing.T) {
 
 // TestUniqueGatewayPorts verifies each harness uses a distinct gateway port.
 func TestUniqueGatewayPorts(t *testing.T) {
-	harnesses := []Harness{&OpenClawHarness{}, &HermesHarness{}, &IronClawHarness{}}
+	harnesses := []Harness{&OpenClawHarness{}, &HermesHarness{}}
 	seen := map[int32]string{}
 	for _, h := range harnesses {
 		port := h.GatewayPort()
