@@ -144,7 +144,7 @@ var _ = Describe("ClawAgent Controller — Workspace & Credential Security", fun
 
 		It("should use emptyDir for openclaw-home volume", func() {
 			dep := getDeployment(agentName)
-			vol := findVolume(dep, "openclaw-home")
+			vol := findVolume(dep, "harness-home")
 			Expect(vol).NotTo(BeNil())
 			Expect(vol.VolumeSource.EmptyDir).NotTo(BeNil(), "expected emptyDir volume source")
 			Expect(vol.VolumeSource.PersistentVolumeClaim).To(BeNil(), "should NOT have PVC volume source")
@@ -199,7 +199,7 @@ var _ = Describe("ClawAgent Controller — Workspace & Credential Security", fun
 
 		It("should use PVC volume source on the deployment", func() {
 			dep := getDeployment(agentName)
-			vol := findVolume(dep, "openclaw-home")
+			vol := findVolume(dep, "harness-home")
 			Expect(vol).NotTo(BeNil())
 			Expect(vol.VolumeSource.PersistentVolumeClaim).NotTo(BeNil(), "expected PVC volume source")
 			Expect(vol.VolumeSource.PersistentVolumeClaim.ClaimName).To(Equal(agentName + clawv1.PVCSuffix))
@@ -476,7 +476,7 @@ var _ = Describe("ClawAgent Controller — Workspace & Credential Security", fun
 			dep := getDeployment(agentName)
 
 			// PVC volume
-			homeVol := findVolume(dep, "openclaw-home")
+			homeVol := findVolume(dep, "harness-home")
 			Expect(homeVol).NotTo(BeNil())
 			Expect(homeVol.VolumeSource.PersistentVolumeClaim).NotTo(BeNil())
 			Expect(homeVol.VolumeSource.PersistentVolumeClaim.ClaimName).To(Equal(agentName + clawv1.PVCSuffix))
@@ -860,6 +860,76 @@ var _ = Describe("ClawAgent Controller — Workspace & Credential Security", fun
 			plugins := cfg["plugins"].(map[string]any)["entries"].(map[string]any)
 			_, hasA2A := plugins["a2a-gateway"]
 			Expect(hasA2A).To(BeFalse())
+		})
+	})
+})
+
+var _ = Describe("ClawAgent Controller — Create-or-Update", func() {
+
+	const ns = "default"
+
+	reconcileAgent := func(name string) {
+		r := &ClawAgentReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: ns},
+		})
+		Expect(err).NotTo(HaveOccurred())
+	}
+
+	getConfigMap := func(name string) *corev1.ConfigMap {
+		cm := &corev1.ConfigMap{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, cm)).To(Succeed())
+		return cm
+	}
+
+	deleteIfExists := func(obj client.Object, key types.NamespacedName) {
+		err := k8sClient.Get(ctx, key, obj)
+		if err == nil {
+			_ = k8sClient.Delete(ctx, obj)
+		}
+	}
+
+	Context("when agent identity is updated", func() {
+		const agentName = "test-update"
+
+		BeforeEach(func() {
+			agent := &clawv1.ClawAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: agentName, Namespace: ns},
+				Spec: clawv1.ClawAgentSpec{
+					Identity: clawv1.AgentIdentitySpec{
+						Soul: "Original soul text",
+					},
+					Model: clawv1.AgentModelSpec{
+						Provider: "anthropic",
+						Name:     "claude-haiku-4-5",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+			reconcileAgent(agentName)
+		})
+
+		AfterEach(func() {
+			deleteIfExists(&clawv1.ClawAgent{}, types.NamespacedName{Name: agentName, Namespace: ns})
+		})
+
+		It("should update the identity ConfigMap when soul changes", func() {
+			// Verify original soul
+			cm := getConfigMap(agentName + "-identity")
+			Expect(cm.Data["SOUL.md"]).To(Equal("Original soul text"))
+
+			// Update the agent's soul
+			agent := &clawv1.ClawAgent{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: agentName, Namespace: ns}, agent)).To(Succeed())
+			agent.Spec.Identity.Soul = "Updated soul text"
+			Expect(k8sClient.Update(ctx, agent)).To(Succeed())
+
+			// Reconcile again
+			reconcileAgent(agentName)
+
+			// Verify ConfigMap was updated
+			cm = getConfigMap(agentName + "-identity")
+			Expect(cm.Data["SOUL.md"]).To(Equal("Updated soul text"))
 		})
 	})
 })
